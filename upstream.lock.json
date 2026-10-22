@@ -1,0 +1,20 @@
+{
+  "repository": "https://github.com/chris-ritsen/samsung-tv-root",
+  "commit": "4ad2c4d3b0d0e0da4b5b7ebe4a787e94596f416b",
+  "archiveUrl": "https://api.github.com/repos/chris-ritsen/samsung-tv-root/tarball/4ad2c4d3b0d0e0da4b5b7ebe4a787e94596f416b",
+  "archiveSha256": "b6e97354df9b2b73de4c84daf32158774491af88f23cef628e135907ae95a027",
+  "files": {
+    "src/samsung_tv_root/__init__.py": "c01a308499f41c05553136a7a9e3d4c95117796a69f31ca449e792c742ba5912",
+    "src/samsung_tv_root/archive_root.py": "f0a303c22fe01cad8b95bb4f4ff8d4b121f5070f06397752ebaacb01806eec79",
+    "src/samsung_tv_root/root_agent.py": "ee959b0e3c315d819a2a0fe89f3a45b744cea7f0330482b8059a82893b2a9c87",
+    "src/samsung_tv_root/sdb.py": "587f6d3f54a36386d6205eeabcd750f74cfdd4edf086bcc1f07d915ba40b29e2",
+    "src/samsung_tv_root/resources.py": "70b66360ac7eba32d126d4d08f2a22ebee4847e8795cad0a8c4572c2a4e37af7",
+    "payloads/common/SamsungTvArchiveRoot.cs": "868ce8957a421931dc191bc9289dbbb31073a68b7cf02e53104a6a150ae1371e",
+    "payloads/common/SamsungTvArchiveRoot.csproj": "200a9f57f018067b201edda9d99b24295749fe4a54e751d6985710838c24a7c2",
+    "payloads/common/SamsungTvRootAgent.cs": "3b53e8c9de66331ca5336f57bc8eba33adf66ca2860a29daedbbeb3a98ea8405",
+    "payloads/common/SamsungTvRootAgent.csproj": "aa37ba1eb29fd048cf810f98fed01da9b96c389dfefe4306d474c83fea7d1dde",
+    "pyproject.toml": "c51303d9aa736dbb197f16baa41e79e253c53b25c6d50a6ae169c12a7e104547",
+    "LICENSE": "6c7356b59f6bc0e1cb461849538baae609ef0abf6b963ea565f9eec64efb4dec",
+    "README.md": "435d5fc6345357e0b03a9622bf5ec68e4e5a4c4e99a713df41b42b6203385e6a"
+  }
+}

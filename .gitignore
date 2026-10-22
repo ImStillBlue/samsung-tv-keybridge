@@ -1,0 +1,42 @@
+# Runtime configuration and private material never belong in this repository.
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.pem
+*.key
+*.token
+*.log
+controller.json
+options.json
+private/
+secrets/
+state/
+data/
+
+# Dependencies, downloaded sources and generated outputs.
+.venv/
+node_modules/
+.cache/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+bin/
+obj/
+*.pyc
+*.dll
+*.wgt
+*.tar
+*.tar.gz
+*.zip
+
+# Editor and agent state.
+.idea/
+.vscode/
+.omo/
+.senpi/
+.DS_Store

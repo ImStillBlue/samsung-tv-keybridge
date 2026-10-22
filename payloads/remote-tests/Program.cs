@@ -1,0 +1,863 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
+
+namespace Theatre.Remote.Tests
+{
+    internal static class Program
+    {
+        private static readonly byte[] Token = Enumerable.Range(0, 32).Select(x => (byte)x).ToArray();
+        private static readonly byte[] Nonce = Enumerable.Range(32, 32).Select(x => (byte)x).ToArray();
+        private static byte[] Banner => Encoding.ASCII.GetBytes("THEATRE-REMOTE/1\t" + FrameCodec.Hex(Nonce) + "\n");
+        private static byte[] Frame(string payload) => FrameCodec.Encode(Token, Nonce, payload);
+        private static byte[] Record(int bits, ushort type, ushort code, int value) =>
+            InputEvent.Create(bits, type, code, value);
+        private static int assertions;
+
+        private static void Check(bool condition, string message)
+        {
+            assertions++;
+            if (!condition) throw new Exception(message);
+        }
+
+        private static T Throws<T>(Action action) where T : Exception
+        {
+            try { action(); }
+            catch (T error) { assertions++; return error; }
+            throw new Exception("expected " + typeof(T).Name);
+        }
+
+        private static void Equal(byte[] expected, byte[] actual) =>
+            Check(expected.SequenceEqual(actual), "bytes differ");
+
+        public static int Main()
+        {
+            var tests = new (string Name, Action Run)[]
+            {
+                ("upstream_python_wire_vectors", WireVectors),
+                ("authentication_nonce_utf8_and_length_boundaries", AuthenticationFailures),
+                ("strict_private_configuration_schema", ConfigSchema),
+                ("heartbeat_sequences_and_terminal_monotonic_expiry", Heartbeats),
+                ("exact_32_and_64_bit_input_layouts", EventLayouts),
+                ("linux_open_flags_match_arm_and_x86_abi", OpenFlags),
+                ("discovery_identity_capabilities_and_ambiguity", Discovery),
+                ("identity_json_and_root_gate", Identity),
+                ("exhaustive_key_forwarding_and_mapping", ExhaustiveKeys),
+                ("mixed_packets_preserve_scans_order_and_sync", MixedPackets),
+                ("packet_overflow_dropped_sync_and_unpaired_scan", InvalidPackets),
+                ("ready_follows_identity_heartbeat_create_and_grab", Readiness),
+                ("no_first_heartbeat_means_no_forwarder_or_grab", MissingFirstHeartbeat),
+                ("observe_never_grabs_or_creates_virtual_device", Observe),
+                ("normal_eof_releases_held_keys_and_device_once", NormalShutdown),
+                ("bad_hmac_releases_active_grab", BadHmac),
+                ("replayed_heartbeat_releases_active_grab", Replay),
+                ("authenticated_commands_are_rejected", CommandsRejected),
+                ("fragmented_live_frame_cannot_extend_deadline", FragmentedFrame),
+                ("fragmented_banner_times_out_before_acquisition", FragmentedBanner),
+                ("unterminated_network_flood_is_bounded", NetworkFlood),
+                ("blocked_ready_write_releases_at_health_deadline", BlockedReady),
+                ("blocked_event_write_releases_held_keys", BlockedEvent),
+                ("partial_writes_do_not_reset_the_deadline", PartialWrites),
+                ("failed_socket_write_releases_native_resources", FailedSocketWrite),
+                ("device_loss_and_short_reads_release", DeviceLoss),
+                ("failed_native_forward_releases_uncertain_down", FailedForward),
+                ("cleanup_failures_do_not_skip_other_releases", CleanupFailures),
+                ("every_setup_failure_cleans_partial_resources", SetupFailures),
+                ("failed_grab_and_held_key_races_release", GrabFailures),
+                ("input_flood_expires_without_polling_or_sleep", InputFlood),
+                ("input_flood_yields_to_invalid_heartbeat", InputFloodHealth),
+                ("forward_mode_expires_at_thirty_seconds", ForwardLimit),
+                ("healthy_map_lease_renews_and_closes_normally", RenewingMap),
+                ("physical_packet_flood_is_bounded", PacketFlood),
+                ("real_loopback_socket_handshake_and_eof", RealSocket)
+            };
+            int failures = 0;
+            foreach (var test in tests)
+            {
+                try { test.Run(); Console.WriteLine("PASS " + test.Name); }
+                catch (Exception error)
+                {
+                    failures++;
+                    Console.Error.WriteLine("FAIL " + test.Name + ": " + error);
+                }
+            }
+            Console.WriteLine($"{tests.Length - failures}/{tests.Length} tests passed; {assertions} assertions");
+            return failures == 0 ? 0 : 1;
+        }
+
+        private static void WireVectors()
+        {
+            // Generated by the pinned root_agent.py encode_authenticated_frame,
+            // not by the C# code under test.
+            const string heartbeat = "HEARTBEAT\t1\tc1bfdecb9f56357a4d6d13e9b744caf09350ae8556744f44e02a2420e9f90594\n";
+            const string key = "EVENT\t1\t1\t63\t1\t0\tff70568f61a1f60126ac8cf20054a5057efc476768df07be340d4fe1b0060ba5\n";
+            Equal(Encoding.ASCII.GetBytes(heartbeat), Frame("HEARTBEAT\t1"));
+            Equal(Encoding.ASCII.GetBytes(key), Frame("EVENT\t1\t1\t63\t1\t0"));
+            Check(FrameCodec.Verify(Token, Nonce, Encoding.ASCII.GetBytes(key)) == "EVENT\t1\t1\t63\t1\t0", "wire payload");
+            Check(FrameCodec.Verify(Token, Nonce, Encoding.ASCII.GetBytes(heartbeat.Replace("\n", "\r\n"))) == "HEARTBEAT\t1", "upstream CRLF");
+            Equal(Nonce, FrameCodec.Challenge(Banner));
+        }
+
+        private static void AuthenticationFailures()
+        {
+            byte[] bad = Frame("HEARTBEAT\t1");
+            bad[bad.Length - 2] = bad[bad.Length - 2] == 48 ? (byte)49 : (byte)48;
+            Throws<InvalidDataException>(() => FrameCodec.Verify(Token, Nonce, bad));
+            Throws<InvalidDataException>(() => FrameCodec.Verify(Nonce, Nonce, Frame("HEARTBEAT\t1")));
+            Throws<InvalidDataException>(() => FrameCodec.Verify(Token, Token, Frame("HEARTBEAT\t1")));
+            Throws<InvalidDataException>(() => FrameCodec.Verify(Token, Nonce, new byte[] { 10 }));
+            Throws<InvalidDataException>(() => FrameCodec.Verify(Token, Nonce, Frame("HEARTBEAT\t1").SkipLast(1).ToArray()));
+            Throws<DecoderFallbackException>(() => FrameCodec.Verify(Token, Nonce, new byte[] { 255, 9, 10 }));
+            Throws<InvalidDataException>(() => FrameCodec.Encode(Token, Nonce, "HEARTBEAT\t1\nEXEC"));
+            Throws<InvalidDataException>(() => FrameCodec.Encode(Token, Nonce, new string('x', 4096)));
+            Throws<InvalidDataException>(() => FrameCodec.Challenge(Encoding.ASCII.GetBytes("SAMSUNG-TV-ROOT/1\t" + FrameCodec.Hex(Nonce) + "\n")));
+            Throws<InvalidDataException>(() => FrameCodec.Challenge(Banner.Concat(new byte[] { 10 }).ToArray()));
+            Throws<InvalidDataException>(() => FrameCodec.DecodeHex(new string('A', 64), 32));
+            Throws<InvalidDataException>(() => FrameCodec.DecodeHex(new string('0', 62), 32));
+        }
+
+        private static string Config(string mode = "map", string host = "127.0.0.1", int port = 12345) =>
+            $"{{\"host\":\"{host}\",\"port\":{port},\"token\":\"{FrameCodec.Hex(Token)}\",\"mode\":\"{mode}\"}}";
+
+        private static void ConfigSchema()
+        {
+            foreach (string mode in new[] { "observe", "forward", "map" })
+            {
+                using var config = Configuration.Parse(Encoding.UTF8.GetBytes(Config(mode)));
+                Check(config.Host.Equals(IPAddress.Loopback) && config.Port == 12345 && config.Mode == mode, "parsed config");
+                Equal(Token, config.Token);
+            }
+            foreach (string text in new[]
+            {
+                Config("filter"), Config(host: "localhost"), Config(host: "127.1"),
+                Config(host: "::1"), Config(port: 0), Config(port: 65536),
+                Config().Replace("\"mode\":\"map\"", "\"mode\":\"map\",\"mode\":\"observe\""),
+                Config().Replace("\"mode\":\"map\"", "\"mode\":\"map\",\"command\":\"exec\""),
+                Config().Replace(",\"mode\":\"map\"", ""),
+                "{}", "[]", Config().Replace(FrameCodec.Hex(Token), Convert.ToBase64String(Token))
+            })
+                Throws<Exception>(() => Configuration.Parse(Encoding.UTF8.GetBytes(text)));
+            var cleared = Configuration.Parse(Encoding.UTF8.GetBytes(Config()));
+            cleared.Dispose();
+            Check(cleared.Token.All(x => x == 0), "token not cleared");
+            Throws<InvalidDataException>(() => Configuration.Consume("relative.json"));
+        }
+
+        private static void Heartbeats()
+        {
+            var clock = new Clock();
+            var health = new Health(clock);
+            foreach (string invalid in new[] { "HEARTBEAT\t0", "HEARTBEAT\t2", "HEARTBEAT\t01", "HEARTBEAT\t+1", "HEARTBEAT\t-1", "READY", "HEARTBEAT\t1\tx" })
+                Throws<InvalidDataException>(() => health.Accept(invalid));
+            health.Accept("HEARTBEAT\t1");
+            Throws<InvalidDataException>(() => health.Accept("HEARTBEAT\t1"));
+            clock.Now = 7999;
+            health.Accept("HEARTBEAT\t3");
+            Check(health.Deadline == 15999, "renewed relative to monotonic receive time");
+            clock.Now = 15999;
+            Throws<TimeoutException>(() => health.Accept("HEARTBEAT\t4"));
+            Throws<TimeoutException>(() => health.Check());
+        }
+
+        private static void OpenFlags()
+        {
+            foreach (Architecture architecture in new[]
+                { Architecture.Arm, Architecture.Arm64, Architecture.X86, Architecture.X64 })
+            {
+                int expected = architecture == Architecture.Arm || architecture == Architecture.Arm64
+                    ? 0x88800 : 0xa0800;
+                Check(NativeIo.OpenFlags(architecture, false) == expected, "read-only native flags");
+                Check(NativeIo.OpenFlags(architecture, true) == (expected | 1), "write-only native flags");
+            }
+            Throws<PlatformNotSupportedException>(() => NativeIo.OpenFlags((Architecture)int.MaxValue, false));
+        }
+
+        private static void EventLayouts()
+        {
+            foreach (int bits in new[] { 4, 8 })
+            {
+                byte[] bytes = Record(bits, ushort.MaxValue, 560, int.MinValue);
+                bytes[0] = 0xa5;
+                bytes[bits] = 0x9f;
+                InputEvent item = InputEvent.Parse(bytes, bits);
+                Check(item.Type == ushort.MaxValue && item.Code == 560 && item.Value == int.MinValue, "input_event offsets");
+                Throws<InvalidDataException>(() => InputEvent.Parse(bytes.Take(bytes.Length - 1).ToArray(), bits));
+                Throws<InvalidDataException>(() => InputEvent.Parse(bytes.Concat(new byte[] { 0 }).ToArray(), bits));
+                Throws<InvalidDataException>(() => InputEvent.Parse(bytes, bits == 4 ? 8 : 4));
+            }
+            Throws<InvalidDataException>(() => InputEvent.Size(2));
+            Throws<InvalidDataException>(() => InputEvent.Parse(Array.Empty<byte>(), 8));
+        }
+
+        private static void Discovery()
+        {
+            var clock = new Clock();
+            var io = new DeviceIo(clock);
+            io.Nodes["/dev/input/event0"] = new DeviceSpec { Name = RemoteIdentity.VirtualName };
+            io.Nodes["/dev/input/event97"] = new DeviceSpec();
+            using (InputDevice input = InputDevice.Discover(io, io.Nodes.Keys, 8))
+            {
+                Check(input.Identity.Node == "/dev/input/event97", "must discover by identity");
+                Check(input.Identity.Matches, "matching device");
+            }
+            Check(io.OpenDescriptors.Count == 0, "discovery descriptors leaked");
+            foreach (DeviceSpec spec in new[]
+            {
+                new DeviceSpec { Name = "Another remote" }, new DeviceSpec { Bus = 3 },
+                new DeviceSpec { Vendor = 1 }, new DeviceSpec { Product = 1 },
+                new DeviceSpec { MissingKey = 63 }, new DeviceSpec { MissingKey = 560 }
+            })
+            {
+                io = new DeviceIo(clock);
+                io.Nodes["/dev/input/event12"] = spec;
+                Throws<InvalidDataException>(() => InputDevice.Discover(io, io.Nodes.Keys, 8));
+                Check(io.OpenDescriptors.Count == 0, "failed discovery leaked fd");
+            }
+            io = new DeviceIo(clock);
+            io.Nodes["/dev/input/event1"] = new DeviceSpec();
+            io.Nodes["/dev/input/event7"] = new DeviceSpec();
+            Throws<InvalidDataException>(() => InputDevice.Discover(io, io.Nodes.Keys, 4));
+            Check(io.OpenDescriptors.Count == 0, "ambiguous discovery leaked fd");
+        }
+
+        private static void Identity()
+        {
+            using var rig = new Rig();
+            using var json = JsonDocument.Parse(rig.Input.Identity.Json(42, 0, 0, "map"));
+            JsonElement root = json.RootElement;
+            Check(root.EnumerateObject().Count() == 10, "identity schema");
+            Check(root.GetProperty("bus").GetString() == "0005"
+                && root.GetProperty("vendor").GetString() == "04e8"
+                && root.GetProperty("product").GetString() == "2075"
+                && root.GetProperty("version").GetString() == "0001", "identity hex fields");
+            Throws<InvalidOperationException>(() => rig.Input.Identity.Json(42, 1, 0, "map"));
+            Throws<InvalidOperationException>(() => rig.Input.Identity.Json(42, 0, 1, "map"));
+            Throws<InvalidOperationException>(() => rig.Run(uid: 1));
+            Check(!rig.Native.Log.Contains("grab:1"), "non-root acquired grab");
+        }
+
+        private static void ExhaustiveKeys()
+        {
+            foreach (int bits in new[] { 4, 8 })
+            foreach (string mode in new[] { "observe", "forward", "map" })
+            {
+                var filter = new PacketFilter(mode, bits);
+                for (ushort code = 0; code < 768; code++)
+                foreach (int value in new[] { 0, 1, 2 })
+                {
+                    byte[] scan = Record(bits, 4, 4, code + 1000);
+                    byte[] key = Record(bits, 1, code, value);
+                    byte[] sync = Record(bits, 0, 0, 0);
+                    scan[0] = 77; key[0] = 88; sync[0] = 99;
+                    Check(filter.Add(scan).Length == 0 && filter.Add(key).Length == 0, "scan escaped before its key");
+                    Delivery[] result = filter.Add(sync);
+                    Check(result.Length == 3, "packet count");
+                    bool forwarded = mode != "observe" && !(mode == "map" && (code == 63 || code == 560));
+                    Check(result[0].Forwarded == forwarded && result[1].Forwarded == forwarded, "mapped key/scan semantics");
+                    Check(result[2].Forwarded == (mode != "observe"), "sync was suppressed");
+                    Equal(scan, result[0].Record);
+                    Equal(key, result[1].Record);
+                    Equal(sync, result[2].Record);
+                }
+            }
+        }
+
+        private static void MixedPackets()
+        {
+            var filter = new PacketFilter("map", 8);
+            byte[][] events =
+            {
+                Record(8, 4, 4, 100), Record(8, 1, 63, 1),
+                Record(8, 4, 4, 200), Record(8, 1, 561, 1),
+                Record(8, 4, 0, 123), Record(8, 20, 0, 250), Record(8, 0, 0, 0)
+            };
+            Delivery[] result = Array.Empty<Delivery>();
+            foreach (byte[] record in events) result = filter.Add(record);
+            Check(result.Select(x => x.Forwarded).SequenceEqual(new[] { false, false, true, true, true, true, true }), "mixed mapping decisions");
+            for (int i = 0; i < events.Length; i++) Equal(events[i], result[i].Record);
+        }
+
+        private static void InvalidPackets()
+        {
+            var filter = new PacketFilter("map", 8);
+            Throws<IOException>(() => filter.Add(Record(8, 0, 3, 0)));
+            filter.Add(Record(8, 4, 4, 5));
+            Throws<InvalidDataException>(() => filter.Add(Record(8, 0, 0, 0)));
+            filter = new PacketFilter("forward", 8);
+            for (int i = 0; i < PacketFilter.MaximumEvents; i++) filter.Add(Record(8, 1, 59, 1));
+            Throws<InvalidDataException>(() => filter.Add(Record(8, 0, 0, 0)));
+        }
+
+        private static void Readiness()
+        {
+            using var rig = new Rig();
+            rig.OnReady = () => rig.Transport.Eof = true;
+            rig.Run();
+            Check(rig.Transport.Sent[0].StartsWith("IDENTITY\t", StringComparison.Ordinal), "identity first");
+            Check(rig.Transport.Sent[1] == "READY", "READY not sent");
+            List<string> log = rig.Native.Log;
+            Check(log.IndexOf("identity") < log.IndexOf("create")
+                && log.IndexOf("create") < log.IndexOf("grab:1")
+                && log.IndexOf("grab:1") < log.IndexOf("ready"), "readiness order");
+            Released(rig);
+        }
+
+        private static void MissingFirstHeartbeat()
+        {
+            using var rig = new Rig(firstHeartbeat: false);
+            Throws<TimeoutException>(() => rig.Run());
+            Check(rig.Clock.Now == 8000, "handshake deadline");
+            Check(!rig.Native.Log.Contains("create") && !rig.Native.Log.Contains("grab:1")
+                && !rig.Transport.Sent.Contains("READY"), "acquired before first heartbeat");
+            Check(rig.Native.OpenDescriptors.Count == 0, "handshake leaked input");
+        }
+
+        private static void Observe()
+        {
+            using var rig = new Rig();
+            rig.Packet((1, 63, 1), (1, 63, 0));
+            rig.OnWait = () => rig.Transport.Eof = true;
+            rig.Run("observe");
+            Check(!rig.Native.Log.Contains("create") && !rig.Native.Log.Contains("grab:1"), "observe intercepted input");
+            Check(rig.Events().Length == 3 && rig.Events().All(x => x.EndsWith("\t0", StringComparison.Ordinal)), "observe forwarding flags");
+        }
+
+        private static void NormalShutdown()
+        {
+            using var rig = new Rig();
+            rig.Packet((1, 59, 1), (1, 63, 1), (1, 560, 2), (1, 561, 1));
+            rig.OnWait = () => rig.Transport.Eof = true;
+            rig.Run();
+            Released(rig);
+            Check(rig.Native.Log.Count(x => x == "write:1:59:0") == 1
+                && rig.Native.Log.Count(x => x == "write:1:561:0") == 1, "held keys not released exactly once");
+            Check(!rig.Native.Log.Any(x => x.StartsWith("write:1:63:", StringComparison.Ordinal)
+                || x.StartsWith("write:1:560:", StringComparison.Ordinal)), "mapped key leaked");
+            string[] events = rig.Events();
+            Check(events.Length == 5, "physical event count");
+            for (int i = 0; i < events.Length; i++)
+                Check(long.Parse(events[i].Split('\t')[1]) == i + 1, "event sequence");
+            Check(rig.Native.Log.IndexOf("grab:0") < rig.Native.Log.IndexOf("write:1:59:0"), "virtual cleanup precedes native release");
+            rig.Input.Dispose();
+            Check(rig.Native.Log.Count(x => x == "grab:0") == 1, "disposal not idempotent");
+        }
+
+        private static void BadHmac()
+        {
+            using var rig = new Rig();
+            rig.OnReady = () => rig.Transport.Enqueue(FrameCodec.Encode(Nonce, Nonce, "HEARTBEAT\t2"));
+            Throws<InvalidDataException>(() => rig.Run());
+            Released(rig);
+        }
+
+        private static void Replay()
+        {
+            using var rig = new Rig();
+            rig.OnReady = () => rig.Transport.Enqueue(Frame("HEARTBEAT\t1"));
+            Throws<InvalidDataException>(() => rig.Run());
+            Released(rig);
+        }
+
+        private static void CommandsRejected()
+        {
+            using var rig = new Rig();
+            rig.OnReady = () => rig.Transport.Enqueue(Frame("EXEC\tid"));
+            Throws<InvalidDataException>(() => rig.Run());
+            Released(rig);
+        }
+
+        private static void FragmentedFrame()
+        {
+            using var rig = new Rig();
+            rig.OnReady = () =>
+            {
+                rig.Transport.ReadLimit = 1;
+                rig.Transport.ReadAdvance = 500;
+                rig.Transport.Enqueue(Frame("HEARTBEAT\t2"));
+            };
+            Throws<TimeoutException>(() => rig.Run());
+            Check(rig.Clock.Now == 8000, "fragments reset health deadline");
+            Released(rig);
+        }
+
+        private static void FragmentedBanner()
+        {
+            using var rig = new Rig();
+            rig.Transport.ReadLimit = 1;
+            rig.Transport.ReadAdvance = 100;
+            Throws<TimeoutException>(() => rig.Run());
+            Check(rig.Clock.Now == 8000 && !rig.Native.Log.Contains("grab:1"), "fragmented challenge acquired grab");
+        }
+
+        private static void NetworkFlood()
+        {
+            using var rig = new Rig();
+            rig.OnReady = () => rig.Transport.Enqueue(Enumerable.Repeat((byte)'x', 4097).ToArray());
+            Throws<InvalidDataException>(() => rig.Run());
+            Released(rig);
+        }
+
+        private static void BlockedReady()
+        {
+            using var rig = new Rig();
+            rig.Transport.Block = bytes => Encoding.ASCII.GetString(bytes).StartsWith("READY\t", StringComparison.Ordinal);
+            Throws<TimeoutException>(() => rig.Run());
+            Check(rig.Clock.Now == 8000 && !rig.Transport.Sent.Contains("READY"), "blocked READY timeout");
+            Released(rig);
+        }
+
+        private static void BlockedEvent()
+        {
+            using var rig = new Rig();
+            rig.Packet((1, 59, 1));
+            rig.OnReady = () => rig.Transport.Block = _ => true;
+            Throws<TimeoutException>(() => rig.Run());
+            Check(rig.Clock.Now == 8000, "blocked send exceeded live deadline");
+            Check(rig.Native.Log.Contains("write:1:59:0"), "blocked send retained key");
+            Released(rig);
+        }
+
+        private static void PartialWrites()
+        {
+            using var rig = new Rig();
+            rig.Packet((1, 59, 1));
+            rig.OnReady = () => { rig.Transport.WriteLimit = 1; rig.Transport.WriteAdvance = 100; };
+            Throws<TimeoutException>(() => rig.Run());
+            Check(rig.Clock.Now == 8000, "partial writes restarted timeout");
+            Released(rig);
+        }
+
+        private static void FailedSocketWrite()
+        {
+            using var rig = new Rig();
+            rig.Packet((1, 59, 1));
+            rig.OnReady = () => rig.Transport.FailWrite = true;
+            Throws<IOException>(() => rig.Run());
+            Released(rig);
+        }
+
+        private static void DeviceLoss()
+        {
+            foreach (int length in new[] { 0, 15, 23 })
+            {
+                using var rig = new Rig();
+                rig.Native.Input.Enqueue(new byte[length]);
+                Throws<IOException>(() => rig.Run());
+                Released(rig);
+            }
+        }
+
+        private static void FailedForward()
+        {
+            using var rig = new Rig();
+            rig.Packet((1, 59, 1));
+            rig.Native.Fail = operation => operation == "write:1:59:1";
+            Throws<IOException>(() => rig.Run());
+            Check(rig.Native.Log.Contains("write:1:59:0"), "uncertain failed down not released");
+            Released(rig);
+        }
+
+        private static void CleanupFailures()
+        {
+            using var rig = new Rig();
+            rig.Packet((1, 59, 1), (1, 60, 1));
+            rig.Native.Fail = operation => operation == "grab:0" || operation == "write:1:59:0" || operation == "destroy";
+            rig.OnWait = () => rig.Transport.Eof = true;
+            Throws<IOException>(() => rig.Run());
+            Check(rig.Native.Log.Contains("write:1:60:0"), "one failed release skipped another key");
+            Check(rig.Native.Log.Contains("destroy") && rig.Native.OpenDescriptors.Count == 0, "cleanup failure leaked descriptors");
+            Check(rig.Native.Log.IndexOf("close:10") < rig.Native.Log.IndexOf("write:1:59:0"), "physical close did not precede key release");
+        }
+
+        private static void SetupFailures()
+        {
+            foreach (string failure in new[] { "open:virtual", "event:0", "key:63", "misc:4", "definition", "create", "write:20:0:0", "write:0:0:0" })
+            {
+                using var rig = new Rig();
+                rig.Native.Fail = operation => operation == failure;
+                Throws<IOException>(() => rig.Run());
+                Check(!rig.Native.Log.Contains("grab:1") && !rig.Transport.Sent.Contains("READY"), "READY after failed setup");
+                Check(rig.Native.OpenDescriptors.Count == 0, "partial setup leaked descriptor: " + failure);
+                if (rig.Native.Log.Contains("create")) Check(rig.Native.Log.Contains("destroy"), "partly created device not destroyed");
+            }
+        }
+
+        private static void GrabFailures()
+        {
+            using (var rig = new Rig())
+            {
+                rig.Native.Fail = operation => operation == "grab:1";
+                Throws<IOException>(() => rig.Run());
+                Released(rig);
+                Check(!rig.Transport.Sent.Contains("READY"), "READY after failed grab");
+            }
+            foreach (int heldAt in new[] { 1, 2 })
+            {
+                using var rig = new Rig();
+                rig.Native.HeldAtQuery = heldAt;
+                Throws<IOException>(() => rig.Run());
+                Check(!rig.Transport.Sent.Contains("READY"), "held acquisition reported READY");
+                Check(rig.Native.OpenDescriptors.Count == 0 && rig.Native.Log.Contains("destroy"), "held acquisition leaked");
+                if (heldAt == 2) Released(rig);
+            }
+        }
+
+        private static void InputFlood()
+        {
+            using var rig = new Rig();
+            rig.Native.Flood = count => Record(8, (ushort)(count % 2 == 0 ? 0 : 1), (ushort)(count % 2 == 0 ? 0 : 59), count % 2 == 0 ? 0 : 1);
+            rig.Native.ReadAdvance = 10;
+            Throws<TimeoutException>(() => rig.Run());
+            Check(rig.Clock.Now == 8000 && rig.Native.ReleaseAt == 8000, "flood starved expiry");
+            Check(rig.WaitCalls == 0, "flood unexpectedly waited");
+            Released(rig);
+        }
+
+        private static void InputFloodHealth()
+        {
+            using var rig = new Rig();
+            rig.Native.Flood = count =>
+            {
+                if (count == 1) rig.Transport.Enqueue(Frame("HEARTBEAT\t1"));
+                return Record(8, 0, 0, 0);
+            };
+            Throws<InvalidDataException>(() => rig.Run());
+            Check(rig.Native.ReadCount <= 32, "flood starved heartbeat processing");
+            Released(rig);
+        }
+
+        private static void ForwardLimit()
+        {
+            using var rig = new Rig();
+            long sequence = 1;
+            rig.OnWait = () =>
+            {
+                rig.Clock.Now += 2000;
+                rig.Transport.Enqueue(Frame("HEARTBEAT\t" + ++sequence));
+            };
+            Throws<TimeoutException>(() => rig.Run("forward"));
+            Check(rig.Clock.Now == 30000 && rig.Native.ReleaseAt == 30000, "forward mode outlived its independent cap");
+            Released(rig);
+        }
+
+        private static void RenewingMap()
+        {
+            using var rig = new Rig();
+            long sequence = 1;
+            rig.OnWait = () =>
+            {
+                rig.Clock.Now += 2000;
+                if (rig.Clock.Now == 12000) rig.Transport.Eof = true;
+                else rig.Transport.Enqueue(Frame("HEARTBEAT\t" + ++sequence));
+            };
+            rig.Run();
+            Check(rig.Clock.Now == 12000 && rig.Health.LastSequence == 6, "healthy map did not renew");
+            Released(rig);
+        }
+
+        private static void PacketFlood()
+        {
+            using var rig = new Rig();
+            rig.Native.Flood = _ => Record(8, 1, 59, 1);
+            Throws<InvalidDataException>(() => rig.Run());
+            Check(rig.Native.ReadCount == PacketFilter.MaximumEvents + 1, "packet bound");
+            Check(!rig.Native.Log.Contains("write:1:59:1"), "incomplete packet escaped");
+            Released(rig);
+        }
+
+        private static void RealSocket() => RealSocketAsync().GetAwaiter().GetResult();
+
+        private static async Task RealSocketAsync()
+        {
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            try
+            {
+                int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+                using var config = Configuration.Parse(Encoding.UTF8.GetBytes(Config(port: port)));
+                var clock = new Clock();
+                var native = new DeviceIo(clock);
+                native.Nodes["/dev/input/event19"] = new DeviceSpec();
+                using var input = InputDevice.Discover(native, native.Nodes.Keys, 8);
+                var health = new Health(new MonotonicClock());
+                Task<TcpClient> accepted = listener.AcceptTcpClientAsync();
+                using var transport = SocketTransport.Connect(config, health);
+                using var channel = new AuthenticatedChannel(transport, health, Token);
+                Task session = Task.Run(() => Agent.RunSession(input, channel, health, "map",
+                    new SocketWaiter(transport), 42, 0, 0));
+                using (TcpClient peer = await accepted.WaitAsync(TimeSpan.FromSeconds(5)))
+                {
+                    NetworkStream stream = peer.GetStream();
+                    await stream.WriteAsync(Banner);
+                    using var reader = new StreamReader(stream, new UTF8Encoding(false, true), false, 1024, true);
+                    string identityLine = (await reader.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5)))!;
+                    string identity = FrameCodec.Verify(Token, Nonce, Encoding.UTF8.GetBytes(identityLine + "\n"));
+                    Check(identity.StartsWith("IDENTITY\t", StringComparison.Ordinal), "real socket identity");
+                    await stream.WriteAsync(Frame("HEARTBEAT\t1"));
+                    string readyLine = (await reader.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5)))!;
+                    Check(FrameCodec.Verify(Token, Nonce, Encoding.UTF8.GetBytes(readyLine + "\n")) == "READY", "real socket readiness");
+                }
+                await session.WaitAsync(TimeSpan.FromSeconds(5));
+                Check(native.Log.Contains("grab:0") && native.Log.Contains("destroy")
+                    && native.OpenDescriptors.Count == 0, "real socket EOF failed to release");
+            }
+            finally { listener.Stop(); }
+        }
+
+        private static void Released(Rig rig)
+        {
+            Check(rig.Native.Log.Count(x => x == "grab:0") == 1, "grab not released exactly once");
+            Check(rig.Native.Log.Count(x => x == "destroy") == 1, "virtual device not destroyed exactly once");
+            Check(rig.Native.OpenDescriptors.Count == 0, "native fd leaked");
+            Check(rig.Native.Log.IndexOf("close:10") < rig.Native.Log.IndexOf("destroy"), "physical fd retained during virtual destruction");
+        }
+
+        private sealed class Clock : IClock
+        {
+            public long Now;
+            public long Milliseconds => Now;
+        }
+
+        private sealed class DeviceSpec
+        {
+            public string Name = RemoteIdentity.PhysicalName;
+            public ushort Bus = 5;
+            public ushort Vendor = 0x04e8;
+            public ushort Product = 0x2075;
+            public int MissingKey = -1;
+        }
+
+        private sealed class DeviceIo : IDeviceIo
+        {
+            private readonly Clock clock;
+            private int nextDescriptor = 10;
+            private int stateQueries;
+            public readonly Dictionary<string, DeviceSpec> Nodes = new Dictionary<string, DeviceSpec>();
+            public readonly Dictionary<int, string> OpenDescriptors = new Dictionary<int, string>();
+            public readonly List<string> Log = new List<string>();
+            public readonly Queue<byte[]> Input = new Queue<byte[]>();
+            public bool Active;
+            public int ReadCount;
+            public int ReadAdvance;
+            public int HeldAtQuery;
+            public long ReleaseAt = -1;
+            public Func<string, bool>? Fail;
+            public Func<int, byte[]>? Flood;
+
+            public DeviceIo(Clock clock) { this.clock = clock; }
+
+            private void Operation(string operation)
+            {
+                Log.Add(operation);
+                if (Fail?.Invoke(operation) == true) throw new IOException("injected " + operation);
+            }
+
+            public int Open(string path, bool writing)
+            {
+                Operation(writing ? "open:virtual" : "open:physical");
+                int fd = nextDescriptor++;
+                OpenDescriptors.Add(fd, path);
+                return fd;
+            }
+
+            public byte[] Query(int descriptor, uint request, int length)
+            {
+                DeviceSpec spec = Nodes[OpenDescriptors[descriptor]];
+                var bytes = new byte[length];
+                int query = (int)(request & 0xff);
+                switch (query)
+                {
+                    case 6:
+                        Encoding.UTF8.GetBytes(spec.Name).CopyTo(bytes, 0);
+                        break;
+                    case 2:
+                        BitConverter.GetBytes(spec.Bus).CopyTo(bytes, 0);
+                        BitConverter.GetBytes(spec.Vendor).CopyTo(bytes, 2);
+                        BitConverter.GetBytes(spec.Product).CopyTo(bytes, 4);
+                        BitConverter.GetBytes((ushort)1).CopyTo(bytes, 6);
+                        break;
+                    case 0x20:
+                        foreach (int type in new[] { 0, 1, 4, 20 }) bytes[type / 8] |= (byte)(1 << (type % 8));
+                        break;
+                    case 0x21:
+                        Array.Fill(bytes, (byte)255);
+                        if (spec.MissingKey >= 0) bytes[spec.MissingKey / 8] &= (byte)~(1 << (spec.MissingKey % 8));
+                        break;
+                    case 0x24:
+                        bytes[0] = 17;
+                        break;
+                    case 0x18:
+                        stateQueries++;
+                        if (stateQueries == HeldAtQuery) bytes[0] = 1;
+                        break;
+                    default: throw new Exception("unexpected query");
+                }
+                return bytes;
+            }
+
+            public void Control(int descriptor, uint request, int value)
+            {
+                Check(OpenDescriptors.ContainsKey(descriptor), "ioctl after close");
+                string operation = request switch
+                {
+                    NativeIo.Grab => "grab:" + value,
+                    NativeIo.Create => "create",
+                    NativeIo.Destroy => "destroy",
+                    NativeIo.SetEvent => "event:" + value,
+                    NativeIo.SetKey => "key:" + value,
+                    NativeIo.SetMisc => "misc:" + value,
+                    _ => throw new Exception("unexpected control")
+                };
+                if (operation == "grab:0") ReleaseAt = clock.Now;
+                Operation(operation);
+            }
+
+            public int Read(int descriptor, byte[] record)
+            {
+                Check(OpenDescriptors.ContainsKey(descriptor), "read after close");
+                if (!Active) return -1;
+                if (Input.Count == 0 && Flood == null) return -1;
+                ReadCount++;
+                clock.Now += ReadAdvance;
+                byte[] source = Input.Count != 0 ? Input.Dequeue() : Flood!(ReadCount);
+                Array.Copy(source, record, Math.Min(source.Length, record.Length));
+                return source.Length;
+            }
+
+            public void Write(int descriptor, byte[] record)
+            {
+                Check(OpenDescriptors.ContainsKey(descriptor), "write after close");
+                if (record.Length == 1116) { Operation("definition"); return; }
+                InputEvent input = InputEvent.Parse(record, 8);
+                Operation($"write:{input.Type}:{input.Code}:{input.Value}");
+            }
+
+            public void Close(int descriptor)
+            {
+                Check(OpenDescriptors.Remove(descriptor), "duplicate descriptor close");
+                Log.Add("close:" + descriptor);
+            }
+        }
+
+        private sealed class Transport : ITransport
+        {
+            private readonly Clock clock;
+            private readonly Queue<byte> incoming = new Queue<byte>();
+            private readonly List<byte> outgoing = new List<byte>();
+            public readonly List<string> Sent = new List<string>();
+            public int Descriptor => 900;
+            public int ReadLimit = 1024;
+            public int WriteLimit = int.MaxValue;
+            public int ReadAdvance;
+            public int WriteAdvance;
+            public bool Eof;
+            public bool FailWrite;
+            public bool HasData => incoming.Count > 0 || Eof;
+            public Func<byte[], bool>? Block;
+            public Action<string>? OnPayload;
+            public Transport(Clock clock) { this.clock = clock; }
+            public void Enqueue(byte[] bytes) { foreach (byte value in bytes) incoming.Enqueue(value); }
+
+            public int Read(byte[] buffer, int offset, int count)
+            {
+                if (incoming.Count == 0) return Eof ? 0 : -1;
+                clock.Now += ReadAdvance;
+                int length = Math.Min(Math.Min(count, ReadLimit), incoming.Count);
+                for (int i = 0; i < length; i++) buffer[offset + i] = incoming.Dequeue();
+                return length;
+            }
+
+            public int Write(byte[] buffer, int offset, int count)
+            {
+                if (FailWrite) throw new IOException("injected socket failure");
+                if (Block?.Invoke(buffer.Skip(offset).Take(count).ToArray()) == true) return -1;
+                clock.Now += WriteAdvance;
+                int length = Math.Min(count, WriteLimit);
+                for (int i = 0; i < length; i++)
+                {
+                    byte value = buffer[offset + i];
+                    outgoing.Add(value);
+                    if (value == 10)
+                    {
+                        string payload = FrameCodec.Verify(Token, Nonce, outgoing.ToArray());
+                        outgoing.Clear();
+                        Sent.Add(payload);
+                        OnPayload?.Invoke(payload);
+                    }
+                }
+                return length;
+            }
+
+            public void Wait(bool writing, int milliseconds) => clock.Now += milliseconds;
+            public void Dispose() { }
+        }
+
+        private sealed class Rig : IDisposable, ISessionWaiter
+        {
+            public readonly Clock Clock = new Clock();
+            public readonly DeviceIo Native;
+            public readonly Transport Transport;
+            public readonly Health Health;
+            public readonly InputDevice Input;
+            public readonly AuthenticatedChannel Channel;
+            public Action? OnReady;
+            public Action? OnWait;
+            public int WaitCalls;
+
+            public Rig(bool firstHeartbeat = true)
+            {
+                Native = new DeviceIo(Clock);
+                Native.Nodes["/dev/input/event19"] = new DeviceSpec();
+                Input = InputDevice.Discover(Native, Native.Nodes.Keys, 8);
+                Health = new Health(Clock);
+                Transport = new Transport(Clock);
+                Transport.Enqueue(Banner);
+                if (firstHeartbeat) Transport.Enqueue(Frame("HEARTBEAT\t1"));
+                Channel = new AuthenticatedChannel(Transport, Health, Token);
+                Transport.OnPayload = payload =>
+                {
+                    if (payload.StartsWith("IDENTITY\t", StringComparison.Ordinal)) Native.Log.Add("identity");
+                    if (payload != "READY") return;
+                    Native.Log.Add("ready");
+                    Native.Active = true;
+                    OnReady?.Invoke();
+                };
+            }
+
+            public void Packet(params (ushort Type, ushort Code, int Value)[] events)
+            {
+                foreach (var item in events) Native.Input.Enqueue(Record(8, item.Type, item.Code, item.Value));
+                Native.Input.Enqueue(Record(8, 0, 0, 0));
+            }
+
+            public void Run(string mode = "map", uint uid = 0) =>
+                Agent.RunSession(Input, Channel, Health, mode, this, 42, uid, 0);
+            public string[] Events() => Transport.Sent.Where(x => x.StartsWith("EVENT\t", StringComparison.Ordinal)).ToArray();
+
+            public void Wait(int inputDescriptor, int socketDescriptor, int milliseconds)
+            {
+                WaitCalls++;
+                if (Transport.HasData) return;
+                if (OnWait != null) OnWait();
+                else Clock.Now += milliseconds;
+            }
+
+            public void Dispose() { Input.Dispose(); Channel.Dispose(); }
+        }
+
+        private sealed class SocketWaiter : ISessionWaiter
+        {
+            private readonly ITransport transport;
+            public SocketWaiter(ITransport transport) { this.transport = transport; }
+            public void Wait(int inputDescriptor, int socketDescriptor, int milliseconds) =>
+                transport.Wait(false, milliseconds);
+        }
+    }
+}

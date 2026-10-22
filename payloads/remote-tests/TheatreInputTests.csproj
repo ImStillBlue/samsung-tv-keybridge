@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>10.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <UseAppHost>false</UseAppHost>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <StartupObject>Theatre.Remote.Tests.Program</StartupObject>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="../remote/Agent.cs" Link="Agent.cs" />
+    <Compile Include="../remote/Channel.cs" Link="Channel.cs" />
+    <Compile Include="../remote/InputDevice.cs" Link="InputDevice.cs" />
+    <Compile Include="../remote/UinputForwarder.cs" Link="UinputForwarder.cs" />
+  </ItemGroup>
+</Project>
