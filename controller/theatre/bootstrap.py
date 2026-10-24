@@ -67,8 +67,8 @@ def assess(client: SdbClient) -> TargetAssessment:
     runtimes = capture(
         client,
         """for r in /usr/share/dotnet/shared/Microsoft.NETCore.App/3.1.*;do
-test -r "$r/libcoreclr.so" && test -r "$r/System.Private.CoreLib.dll" &&
-printf "%s\\n" "${r##*/}";done;true""",
+test -r "$r/libcoreclr.so" -a -r "$r/System.Private.CoreLib.dll"
+&& echo "${r##*/}";done;true""".replace("\n", " "),
     )
     if not any(re.fullmatch(r"3\.1\.\d+", line) for line in runtimes.splitlines()):
         raise ControllerError(Operation.ROOT_RUNTIME)
