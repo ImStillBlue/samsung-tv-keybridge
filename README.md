@@ -5,26 +5,27 @@ intended to run as a Home Assistant app.
 
 KeyBridge handles the buttons; your launcher and media apps stay on the TV.
 
-**Development status:** controller and TV-agent sources are available and tested
-locally. Home Assistant packaging and Raspberry Pi ARM64 runtime validation are
-still in progress. **This repository is not yet installable through the Home
-Assistant app store.**
+**Status:** version 0.6.0 runs as a protected Home Assistant app on a Raspberry
+Pi 5 (HAOS 18.3), with automatic re-root after TV reboots, configurable safe-key
+mappings, discovery mode, remote auto-detection and a developer SDB bridge.
+New installations default to disabled; see [DOCS.md](DOCS.md) to set it up.
 
 ## What it does
 
-The current implementation maps two physical remote buttons:
+Configure verified remote buttons to installed applications. For example only:
 
 | Button | Destination | Installed app ID |
 | --- | --- | --- |
 | Home | Theatre custom launcher | `Theatre001.Home` |
 | Samsung TV Plus | Moonfin | `MoonfinApp.moonfin` |
 
-These routes are currently fixed in source, not configurable through a UI.
-Both destination apps must already be installed. The Theatre widget is a
+Mappings have no defaults and must be explicitly configured in Home Assistant.
+Destination apps must already be installed. The Theatre widget is a
 separate project and is not included here.
 
 - Discovers the paired remote by identity rather than a changing event-device number.
-- Filters the two mapped keys and forwards other remote input locally on the TV.
+- Filters only configured keys whose destinations are installed and forwards other input.
+- Offers continuous, non-grabbing discovery of app IDs and physical key events.
 - Uses authenticated root and input sessions with fresh session credentials.
 - Checks that the TV explicitly reports on before acquiring root.
 - Reconnects only when configured, without opening an app over active playback.
@@ -61,8 +62,8 @@ The implementation requires developer connectivity and a working compatible
 archive-root route. A stock TV without those prerequisites cannot run this
 controller. The root integration is pinned in `upstream.lock.json`.
 
-Local extraction checks passed 82 controller tests and 36 managed-agent tests,
-with Python lint and type checks clean. Hardware reboot/failure timing and
+Local checks pass 147 controller tests and 36 managed-agent tests, with Python
+lint and type checks clean. Hardware reboot/failure timing and
 extended unchanged-key acceptance remain unverified. The managed ABI round-trip
 tests share production encoding and parsing, so they alone do not independently
 prove native record offsets.
@@ -72,31 +73,37 @@ prove native record offsets.
 The deployment target is a protected, Supervisor-managed app on an ARM64
 Raspberry Pi 5, with its own persistent data and no Home Assistant Core changes.
 
-Work remaining before an installable release:
+The app manifest and Dockerfile live at this repository's root. Its build uses
+native aarch64 or amd64 Python/OpenSSL. ARM64 uses checksum-pinned, container-local
+QEMU for Samsung's x86-64 SDB; amd64 executes the private loader directly.
+The app explicitly owns the SDB server, checks its wire
+protocol, and stops it after controller cleanup. It never registers host binfmt.
 
-- Implement the app manifest, image and configuration adapter.
-- Validate native ARM64 Python/OpenSSL dependencies.
-- Isolate the x86-64 Samsung SDB runtime behind explicitly invoked user-mode
-  emulation, without host-wide binfmt registration.
-- Supervise the SDB server explicitly; a wrapper alone cannot handle its
-  foreign-binary self-exec.
-- Verify app startup, shutdown, protected-mode compatibility and resource use
-  on an actual Pi.
+For a local installation, copy the source folder (without `.git`, caches or
+private files) into Home Assistant's `/local_apps/samsung-tv-keybridge`, reload
+the app store, and install **Samsung TV KeyBridge** under Local apps. Source must
+be available on the configured repository branch before Git-based installation
+can use these changes; uncommitted local changes are not published automatically.
 
-No Home Assistant installation instructions are published until that path works.
+See [DOCS.md](DOCS.md) for configuration, Developer Mode, single-controller
+cutover, automatic startup and recovery. Start with `enabled: false`.
 
 ## Source map
 
 | Path | Responsibility |
 | --- | --- |
-| `controller/theatre/config.py` | App IDs, key codes and configuration policy |
+| `controller/theatre/config.py`, `keys.py` | Explicit mappings, safe keys and configuration policy |
 | `controller/theatre/main.py` | Mapping dispatch and session supervision |
 | `controller/theatre/remote.py` | Authenticated input transport and heartbeat |
 | `controller/theatre/{archive,bootstrap,state}.py` | Root lease, staging and cleanup |
 | `controller/theatre/power.py` | Explicit-on power gate |
+| `controller/theatre/ha_app.py` | Home Assistant options and owned SDB lifecycle |
+| `controller/theatre/bridge.py` | Opt-in, allowlisted developer SDB relay independent of mappings |
+| `config.yaml`, `Dockerfile`, `packaging/` | Protected aarch64/amd64 app and pinned build inputs |
 | `payloads/remote/` | TV-side filtering, forwarding and watchdog |
 | `controller/tests/`, `payloads/remote-tests/` | Regression tests |
 | `scripts/build-payloads.js` | Verified upstream extraction and payload compilation |
+| `scripts/dev-bridge.js` | PC helper for sharing the app-owned SDB server |
 | `controller/uv.lock`, `upstream.lock.json` | Dependency and upstream pins |
 
 The internal Python package remains `theatre`; KeyBridge is the public project
@@ -160,5 +167,5 @@ is not a secret scanner.
 Built on the pinned `chris-ritsen/samsung-tv-root` integration. Adapted portions
 retain source attribution. See [THIRD_PARTY.md](THIRD_PARTY.md).
 
-A license for the original KeyBridge code has not yet been selected.
-Public visibility alone does not grant an open-source license.
+Original KeyBridge code is licensed under MIT, Copyright (c) 2026 ImStillBlue.
+See [LICENSE](LICENSE). Adapted upstream portions retain the Unlicense.

@@ -12,5 +12,11 @@ Python dependencies are recorded in `controller/uv.lock`; their individual
 licenses continue to apply. Samsung SDK binaries are not included in this
 source repository.
 
-No project-wide license for the original Theatre code has been selected yet.
-Public visibility alone does not grant an open-source license.
+Both app builds download the pinned Samsung SDK; only ARM64 downloads the Debian QEMU package
+declared in `packaging/fetch-build-inputs.sh`. QEMU's copyright/license notice is
+retained in the image at `/opt/keybridge/licenses/qemu-copyright`. Private amd64
+runtime libraries come from the digest-pinned Debian Python image; Python and
+OpenSSL run natively on aarch64 and amd64. No downloaded binary is committed to this repo.
+
+Original KeyBridge code is MIT licensed, Copyright (c) 2026 ImStillBlue; see
+LICENSE. Adapted upstream portions remain under the Unlicense, not relicensed.
