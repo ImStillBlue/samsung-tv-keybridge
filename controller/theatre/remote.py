@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import hmac
+import logging
 import re
 import secrets
 from collections.abc import AsyncIterator
@@ -16,16 +17,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from theatre.config import (
     HEARTBEAT_SECONDS,
-    HOME_KEY,
     RELEASE_SECONDS,
     TOKEN_BYTES,
-    TV_PLUS_KEY,
     ControllerConfig,
     ControllerError,
     Mode,
     Operation,
+    RemoteName,
     RootLostError,
 )
+from theatre.keys import SAFE_KEYS
 
 MAXIMUM_FRAME_BYTES: Final = 4096
 MAX_SEQUENCE: Final = (1 << 63) - 1
@@ -74,11 +75,11 @@ class RemoteIdentity(BaseModel):
     process_id: Annotated[int, Field(gt=0, le=2147483647)]
     user_id: Literal[0]
     group_id: Literal[0]
-    device: Literal["Smart Control 2016"]
+    device: RemoteName
     node: Annotated[str, Field(pattern=r"^/dev/input/event[0-9]+$")]
     bus: Literal["0005"]
     vendor: Literal["04e8"]
-    product: Literal["2075"]
+    product: Annotated[str, Field(pattern=r"^[0-9a-f]{4}$")]
     version: Annotated[str, Field(pattern=r"^[0-9a-f]{4}$")]
     mode: Literal["observe", "forward", "map"]
 
@@ -94,7 +95,9 @@ class InputEvent:
     forwarded: bool
 
     @classmethod
-    def parse(cls, payload: str, previous: int, mode: Mode) -> "InputEvent":
+    def parse(
+        cls, payload: str, previous: int, mode: Mode, keys: frozenset[int]
+    ) -> "InputEvent":
         """Parse numeric bounds, replay ordering and mode-consistent forwarding."""
         fields = payload.split("\t")
         if len(fields) != EVENT_FIELDS or fields[0] != "EVENT":
@@ -121,7 +124,7 @@ class InputEvent:
                 valid = forwarded
             case Mode.MAP:
                 valid = (event_type == SCAN_TYPE and code == SCAN_CODE) or (
-                    forwarded != (event_type == 1 and code in {HOME_KEY, TV_PLUS_KEY})
+                    forwarded != (event_type == 1 and code in keys)
                 )
         if not valid:
             raise ProtocolError(Operation.EVENT_FORWARDING)
@@ -131,7 +134,7 @@ class InputEvent:
 class AgentStarter(Protocol):
     """Only the staging capability needed by the remote callback."""
 
-    async def stage_remote(self, port: int, token: bytes) -> None:
+    async def stage_remote(self, port: int, token: bytes, keys: frozenset[int]) -> None:
         """Start the private managed agent after its listener is bound."""
         ...
 
@@ -223,7 +226,10 @@ class RemoteSession:
     async def next_event(self) -> InputEvent:
         """Read exactly one authenticated event, rejecting replay before dispatch."""
         payload = verify_frame(self._token, self._nonce, await self._line())
-        event = InputEvent.parse(payload, self._sequence, self._config.mode)
+        event = InputEvent.parse(
+            payload, self._sequence, self._config.mode,
+            frozenset(SAFE_KEYS[m.key] for m in self._config.mappings),
+        )
         self._sequence = event.sequence
         return event
 
@@ -262,8 +268,12 @@ async def remote_session(
     session = RemoteSession(config, socket_listener, token)
     try:
         port = listener.extra(attribute=SocketAttribute.local_port)
-        await lease.stage_remote(port, token)
-        _ = await session.start()
+        await lease.stage_remote(port, token, frozenset(SAFE_KEYS[m.key] for m in config.mappings))
+        identity = await session.start()
+        logging.getLogger("theatre").info(
+            "remote.selected device=%s product=%s node=%s",
+            identity.device, identity.product, identity.node,
+        )
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(session.heartbeats)
             try:

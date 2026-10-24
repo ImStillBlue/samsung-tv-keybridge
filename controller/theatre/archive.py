@@ -25,9 +25,10 @@ from samsung_tv_root.sdb import SdbClient
 
 from theatre.bootstrap import assess, capture, sdk_bootstrap
 from theatre.config import (
+    APP_ID_PATTERN,
     HEARTBEAT_SECONDS,
+    MAX_APP_ID_LENGTH,
     MAX_PROCESS_ID,
-    TARGETS,
     AppId,
     ControllerConfig,
     ControllerError,
@@ -87,6 +88,16 @@ class AgentConfiguration(BaseModel):
     port: int
     token: str = Field(repr=False)
     mode: Mode
+    keys: tuple[int, ...]
+    remote_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class Application:
+    """One exact native inventory record."""
+
+    id: AppId
+    name: str
 
 
 @final
@@ -105,21 +116,30 @@ class ArchiveLease:
         self._remote_pid: int | None = None
         self._closed = False
 
-    async def installed_apps(self) -> frozenset[AppId]:
-        """Find only registered permitted targets in the native inventory."""
+    async def list_apps(self) -> tuple[Application, ...]:
+        """Read exact title/ID lines, never substrings in diagnostic output."""
         result = await self._connection.execute(
             "/usr/bin/app_launcher -l", self._config.command_timeout
         )
         if result.exit_code != 0 or result.timed_out:
             raise ControllerError(Operation.APP_INVENTORY)
-        return frozenset(
-            app for app in TARGETS
-            if re.search(rf"(?<![\w.]){re.escape(app)}(?![\w.])", result.stdout)
-        )
+        applications: list[Application] = []
+        for line in result.stdout.splitlines():
+            record = re.fullmatch(r"\s*'([^'\r\n]*)'\s+'([^'\r\n]*)'\s*", line)
+            if (
+                record and re.fullmatch(APP_ID_PATTERN, record[2])
+                and len(record[2]) <= MAX_APP_ID_LENGTH
+            ):
+                applications.append(Application(AppId(record[2]), record[1]))
+        return tuple(applications)
+
+    async def installed_apps(self, requested: frozenset[AppId]) -> frozenset[AppId]:
+        """Return only requested IDs registered as exact inventory records."""
+        return frozenset(app.id for app in await self.list_apps() if app.id in requested)
 
     async def launch(self, app: AppId) -> LaunchResult:
         """Launch one permitted, registered application without a shell extension."""
-        if app not in TARGETS:
+        if app not in {mapping.app_id for mapping in self._config.mappings}:
             raise ControllerError(Operation.APP_FORBIDDEN)
         if not await television_is_on(self._config.tv_host):
             raise TelevisionUnavailableError
@@ -131,7 +151,7 @@ class ArchiveLease:
             raise ControllerError(Operation.LAUNCH_TRANSPORT) from error
         return LaunchResult(result.exit_code == 0 and not result.timed_out)
 
-    async def stage_remote(self, port: int, token: bytes) -> None:
+    async def stage_remote(self, port: int, token: bytes, keys: frozenset[int]) -> None:
         """Stage and start the input agent with only a private config path in argv."""
         directory = self._directory
         for name in ("TheatreInputAgent.dll", "TheatreInputAgent.runtimeconfig.json"):
@@ -140,7 +160,8 @@ class ArchiveLease:
             )
         private = AgentConfiguration(
             host=str(self._config.callback_host), port=port,
-            token=token.hex(), mode=self._config.mode
+            token=token.hex(), mode=self._config.mode,
+            keys=tuple(sorted(keys)), remote_name=self._config.remote_name,
         )
         # WRITEFILE creates root-owned files with mode 0600 in the root-owned
         # 0700 runtime directory. No token is included in an EXEC command or log.

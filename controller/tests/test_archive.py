@@ -10,12 +10,10 @@ from samsung_tv_root.root_agent import (
     RootAgentWrittenFile,
 )
 
+from tests.routes import HOME, MOONFIN, TARGETS
 from theatre import archive
 from theatre.archive import ArchiveLease
 from theatre.config import (
-    HOME,
-    MOONFIN,
-    TARGETS,
     AppId,
     ControllerConfig,
     ControllerError,
@@ -83,10 +81,12 @@ class Connection:
 async def test_registry_matches_whole_permitted_ids(config: ControllerConfig) -> None:
     # Given lookalike registry identifiers and the two real targets.
     connection = Connection()
-    connection.output = f"{HOME}.evil\nprefix{MOONFIN}\n{HOME}\n{MOONFIN}\n"
+    connection.output = (
+        f"{HOME}.evil\nprefix{MOONFIN}\n\t'Theatre'\t '{HOME}'\n\t'Moonfin'\t '{MOONFIN}'\n"
+    )
     lease = ArchiveLease(connection, config)
     # When the native registry is parsed.
-    actual = await lease.installed_apps()
+    actual = await lease.installed_apps(TARGETS)
     # Then only the exact required targets count toward readiness.
     assert actual == TARGETS
 
@@ -95,11 +95,31 @@ async def test_registry_matches_whole_permitted_ids(config: ControllerConfig) ->
 async def test_registry_lookalikes_do_not_satisfy_readiness(config: ControllerConfig) -> None:
     # Given only similarly named packages.
     connection = Connection()
-    connection.output = f"{HOME}.evil\nprefix{MOONFIN}\n"
+    connection.output = (
+        f"\t'Lookalike'\t '{HOME}.evil'\n\t'Lookalike'\t 'prefix{MOONFIN}'\n"
+        f"diagnostic: '{HOME}'\n'{MOONFIN}'\n"
+    )
     # When querying the restricted inventory.
-    actual = await ArchiveLease(connection, config).installed_apps()
+    actual = await ArchiveLease(connection, config).installed_apps(TARGETS)
     # Then no target was invented.
     assert actual == frozenset()
+
+
+@pytest.mark.anyio
+async def test_discovery_lists_all_exact_registered_app_records(config: ControllerConfig) -> None:
+    # Given apps and diagnostic text, When listed, Then only whole records count.
+    connection = Connection()
+    connection.output = (
+        "\t'Moonfin'\t 'MoonfinApp.moonfin'\n"
+        "\t'Another App'\t 'Other.App-1'\n"
+        "diagnostic 'Ignored.App'\n"
+        "\t'Invalid'\t 'bad;id'\n"
+    )
+    actual = await ArchiveLease(connection, config).list_apps()
+    assert actual == (
+        archive.Application(AppId("MoonfinApp.moonfin"), "Moonfin"),
+        archive.Application(AppId("Other.App-1"), "Another App"),
+    )
 
 
 @pytest.mark.anyio
@@ -128,7 +148,7 @@ async def test_invalid_remote_pid_cannot_become_a_kill_target(
     lease = ArchiveLease(connection, configured)
     # When the untrusted launch result is parsed.
     with pytest.raises(ControllerError) as failure:
-        await lease.stage_remote(12345, bytes(32))
+        await lease.stage_remote(12345, bytes(32), frozenset())
     await lease.close()
     # Then no dangerous/unknown PID reaches native cleanup.
     assert failure.value.operation == Operation.REMOTE_START
@@ -147,7 +167,7 @@ async def test_input_secret_is_only_in_private_writefile_payload(
     token = bytes(range(32))
     lease = ArchiveLease(connection, config.model_copy(update={"payloads": tmp_path}))
     # When the input process is staged.
-    await lease.stage_remote(12345, token)
+    await lease.stage_remote(12345, token, frozenset())
     # Then its exact config is sent through authenticated WRITEFILE, not argv/logs.
     private = archive.AgentConfiguration.model_validate_json(
         connection.files["/run/samsung-tv-root/agent-321/input.json"]

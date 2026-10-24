@@ -124,7 +124,7 @@ namespace Theatre.Remote.Tests
         }
 
         private static string Config(string mode = "map", string host = "127.0.0.1", int port = 12345) =>
-            $"{{\"host\":\"{host}\",\"port\":{port},\"token\":\"{FrameCodec.Hex(Token)}\",\"mode\":\"{mode}\"}}";
+            $"{{\"host\":\"{host}\",\"port\":{port},\"token\":\"{FrameCodec.Hex(Token)}\",\"mode\":\"{mode}\",\"keys\":[{(mode == "map" ? "63,560" : "")}]}}";
 
         private static void ConfigSchema()
         {
@@ -141,6 +141,21 @@ namespace Theatre.Remote.Tests
                 Config().Replace("\"mode\":\"map\"", "\"mode\":\"map\",\"mode\":\"observe\""),
                 Config().Replace("\"mode\":\"map\"", "\"mode\":\"map\",\"command\":\"exec\""),
                 Config().Replace(",\"mode\":\"map\"", ""),
+                Config().Replace("\"keys\":[63,560]", "\"keys\":[]"),
+                Config().Replace("\"keys\":[63,560]", "\"keys\":[560,63]"),
+                Config().Replace("\"keys\":[63,560]", "\"keys\":[63,63]"),
+                Config().Replace("\"keys\":[63,560]", "\"keys\":[0]"),
+                Config().Replace("\"keys\":[63,560]", "\"keys\":[768]"),
+                Config().Replace("\"keys\":[63,560]", "\"keys\":[\"63\"]"),
+                Config().Replace("\"keys\":[63,560]", "\"keys\":[true]"),
+                Config().Replace("\"keys\":[63,560]", "\"keys\":null"),
+                Config().Replace("\"keys\":[63,560]", "\"keys\":[1.5]"),
+                Config().Replace(",\"keys\":[63,560]", ""),
+                Config("observe").Replace("\"keys\":[]", "\"keys\":[63]"),
+                Config("forward").Replace("\"keys\":[]", "\"keys\":[63]"),
+                Config().Replace("\"keys\":[63,560]", "\"keys\":[63],\"remote_name\":3"),
+                Config().Replace("\"keys\":[63,560]", "\"keys\":[63],\"remote_name\":\"\""),
+                Config().Replace("\"keys\":[63,560]", "\"keys\":[63],\"remote_name\":\"a\\nb\""),
                 "{}", "[]", Config().Replace(FrameCodec.Hex(Token), Convert.ToBase64String(Token))
             })
                 Throws<Exception>(() => Configuration.Parse(Encoding.UTF8.GetBytes(text)));
@@ -148,6 +163,14 @@ namespace Theatre.Remote.Tests
             cleared.Dispose();
             Check(cleared.Token.All(x => x == 0), "token not cleared");
             Throws<InvalidDataException>(() => Configuration.Consume("relative.json"));
+            // Given an optional override, when parsed, then null and exact names survive.
+            foreach (string remote in new[] { "null", "\"Other Samsung\"" })
+            {
+                using var config = Configuration.Parse(Encoding.UTF8.GetBytes(
+                    Config().Replace("\"keys\":[63,560]", "\"keys\":[63],\"remote_name\":" + remote)));
+                Check(config.Keys.SequenceEqual(new[] { 63 }), "configured key subset");
+                Check(config.RemoteName == (remote == "null" ? null : "Other Samsung"), "name override");
+            }
         }
 
         private static void Heartbeats()
@@ -202,7 +225,7 @@ namespace Theatre.Remote.Tests
             var io = new DeviceIo(clock);
             io.Nodes["/dev/input/event0"] = new DeviceSpec { Name = RemoteIdentity.VirtualName };
             io.Nodes["/dev/input/event97"] = new DeviceSpec();
-            using (InputDevice input = InputDevice.Discover(io, io.Nodes.Keys, 8))
+            using (InputDevice input = InputDevice.Discover(io, io.Nodes.Keys, 8, new[] { 63, 560 }))
             {
                 Check(input.Identity.Node == "/dev/input/event97", "must discover by identity");
                 Check(input.Identity.Matches, "matching device");
@@ -210,21 +233,38 @@ namespace Theatre.Remote.Tests
             Check(io.OpenDescriptors.Count == 0, "discovery descriptors leaked");
             foreach (DeviceSpec spec in new[]
             {
-                new DeviceSpec { Name = "Another remote" }, new DeviceSpec { Bus = 3 },
-                new DeviceSpec { Vendor = 1 }, new DeviceSpec { Product = 1 },
+                new DeviceSpec { Bus = 3 },
+                new DeviceSpec { Vendor = 1 },
+                new DeviceSpec { MissingEvent = 0 }, new DeviceSpec { MissingEvent = 1 },
                 new DeviceSpec { MissingKey = 63 }, new DeviceSpec { MissingKey = 560 }
             })
             {
                 io = new DeviceIo(clock);
                 io.Nodes["/dev/input/event12"] = spec;
-                Throws<InvalidDataException>(() => InputDevice.Discover(io, io.Nodes.Keys, 8));
+                Throws<InvalidDataException>(() => InputDevice.Discover(io, io.Nodes.Keys, 8, new[] { 63, 560 }));
                 Check(io.OpenDescriptors.Count == 0, "failed discovery leaked fd");
             }
             io = new DeviceIo(clock);
             io.Nodes["/dev/input/event1"] = new DeviceSpec();
             io.Nodes["/dev/input/event7"] = new DeviceSpec();
-            Throws<InvalidDataException>(() => InputDevice.Discover(io, io.Nodes.Keys, 4));
+            Throws<InvalidDataException>(() => InputDevice.Discover(io, io.Nodes.Keys, 4, new[] { 63, 560 }));
             Check(io.OpenDescriptors.Count == 0, "ambiguous discovery leaked fd");
+            // Given a different product/name, when auto-detected, then Samsung Bluetooth is accepted.
+            io = new DeviceIo(clock);
+            io.Nodes["/dev/input/event1"] = new DeviceSpec
+                { Name = "Another Samsung", Product = 1, MissingKey = 560 };
+            using (InputDevice input = InputDevice.Discover(io, io.Nodes.Keys, 8, new[] { 63 }))
+                Check(input.Identity.Name == "Another Samsung" && input.Identity.Product == 1, "flexible identity");
+            // Given two candidates, when overridden by exact name, then precisely one is selected.
+            io.Nodes["/dev/input/event2"] = new DeviceSpec();
+            using (InputDevice input = InputDevice.Discover(io, io.Nodes.Keys, 8, new[] { 63 }, "Another Samsung"))
+                Check(input.Identity.Node == "/dev/input/event1", "exact override");
+            Throws<InvalidDataException>(() => InputDevice.Discover(io, io.Nodes.Keys, 8, new[] { 63 }, "missing"));
+            // Given observation with no keys, when discovered, then key capabilities do not invent requirements.
+            io.Nodes.Remove("/dev/input/event2");
+            using (InputDevice input = InputDevice.Discover(io, io.Nodes.Keys, 8, Array.Empty<int>()))
+                Check(input.Identity.Node == "/dev/input/event1", "observe discovery");
+            Check(io.OpenDescriptors.Count == 0, "override discovery leaked fd");
         }
 
         private static void Identity()
@@ -247,8 +287,9 @@ namespace Theatre.Remote.Tests
         {
             foreach (int bits in new[] { 4, 8 })
             foreach (string mode in new[] { "observe", "forward", "map" })
+            foreach (int[] keys in new[] { new[] { 63 }, new[] { 63, 560 } })
             {
-                var filter = new PacketFilter(mode, bits);
+                var filter = new PacketFilter(mode, bits, keys);
                 for (ushort code = 0; code < 768; code++)
                 foreach (int value in new[] { 0, 1, 2 })
                 {
@@ -259,7 +300,7 @@ namespace Theatre.Remote.Tests
                     Check(filter.Add(scan).Length == 0 && filter.Add(key).Length == 0, "scan escaped before its key");
                     Delivery[] result = filter.Add(sync);
                     Check(result.Length == 3, "packet count");
-                    bool forwarded = mode != "observe" && !(mode == "map" && (code == 63 || code == 560));
+                    bool forwarded = mode != "observe" && !(mode == "map" && keys.Contains((int)code));
                     Check(result[0].Forwarded == forwarded && result[1].Forwarded == forwarded, "mapped key/scan semantics");
                     Check(result[2].Forwarded == (mode != "observe"), "sync was suppressed");
                     Equal(scan, result[0].Record);
@@ -271,7 +312,7 @@ namespace Theatre.Remote.Tests
 
         private static void MixedPackets()
         {
-            var filter = new PacketFilter("map", 8);
+            var filter = new PacketFilter("map", 8, new[] { 63, 560 });
             byte[][] events =
             {
                 Record(8, 4, 4, 100), Record(8, 1, 63, 1),
@@ -286,11 +327,11 @@ namespace Theatre.Remote.Tests
 
         private static void InvalidPackets()
         {
-            var filter = new PacketFilter("map", 8);
+            var filter = new PacketFilter("map", 8, new[] { 63, 560 });
             Throws<IOException>(() => filter.Add(Record(8, 0, 3, 0)));
             filter.Add(Record(8, 4, 4, 5));
             Throws<InvalidDataException>(() => filter.Add(Record(8, 0, 0, 0)));
-            filter = new PacketFilter("forward", 8);
+            filter = new PacketFilter("forward", 8, Array.Empty<int>());
             for (int i = 0; i < PacketFilter.MaximumEvents; i++) filter.Add(Record(8, 1, 59, 1));
             Throws<InvalidDataException>(() => filter.Add(Record(8, 0, 0, 0)));
         }
@@ -585,13 +626,13 @@ namespace Theatre.Remote.Tests
                 var clock = new Clock();
                 var native = new DeviceIo(clock);
                 native.Nodes["/dev/input/event19"] = new DeviceSpec();
-                using var input = InputDevice.Discover(native, native.Nodes.Keys, 8);
+                using var input = InputDevice.Discover(native, native.Nodes.Keys, 8, new[] { 63, 560 });
                 var health = new Health(new MonotonicClock());
                 Task<TcpClient> accepted = listener.AcceptTcpClientAsync();
                 using var transport = SocketTransport.Connect(config, health);
                 using var channel = new AuthenticatedChannel(transport, health, Token);
                 Task session = Task.Run(() => Agent.RunSession(input, channel, health, "map",
-                    new SocketWaiter(transport), 42, 0, 0));
+                    new SocketWaiter(transport), 42, 0, 0, config.Keys));
                 using (TcpClient peer = await accepted.WaitAsync(TimeSpan.FromSeconds(5)))
                 {
                     NetworkStream stream = peer.GetStream();
@@ -627,11 +668,12 @@ namespace Theatre.Remote.Tests
 
         private sealed class DeviceSpec
         {
-            public string Name = RemoteIdentity.PhysicalName;
+            public string Name = "Smart Control 2016";
             public ushort Bus = 5;
             public ushort Vendor = 0x04e8;
             public ushort Product = 0x2075;
             public int MissingKey = -1;
+            public int MissingEvent = -1;
         }
 
         private sealed class DeviceIo : IDeviceIo
@@ -685,6 +727,8 @@ namespace Theatre.Remote.Tests
                         break;
                     case 0x20:
                         foreach (int type in new[] { 0, 1, 4, 20 }) bytes[type / 8] |= (byte)(1 << (type % 8));
+                        if (spec.MissingEvent >= 0)
+                            bytes[spec.MissingEvent / 8] &= (byte)~(1 << (spec.MissingEvent % 8));
                         break;
                     case 0x21:
                         Array.Fill(bytes, (byte)255);
@@ -815,7 +859,7 @@ namespace Theatre.Remote.Tests
             {
                 Native = new DeviceIo(Clock);
                 Native.Nodes["/dev/input/event19"] = new DeviceSpec();
-                Input = InputDevice.Discover(Native, Native.Nodes.Keys, 8);
+                Input = InputDevice.Discover(Native, Native.Nodes.Keys, 8, new[] { 63, 560 });
                 Health = new Health(Clock);
                 Transport = new Transport(Clock);
                 Transport.Enqueue(Banner);
@@ -838,7 +882,7 @@ namespace Theatre.Remote.Tests
             }
 
             public void Run(string mode = "map", uint uid = 0) =>
-                Agent.RunSession(Input, Channel, Health, mode, this, 42, uid, 0);
+                Agent.RunSession(Input, Channel, Health, mode, this, 42, uid, 0, mode == "map" ? new[] { 63, 560 } : Array.Empty<int>());
             public string[] Events() => Transport.Sent.Where(x => x.StartsWith("EVENT\t", StringComparison.Ordinal)).ToArray();
 
             public void Wait(int inputDescriptor, int socketDescriptor, int milliseconds)

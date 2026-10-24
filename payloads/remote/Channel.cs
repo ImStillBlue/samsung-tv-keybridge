@@ -1,6 +1,7 @@
 // HMAC framing adapted from samsung-tv-root at 4ad2c4d3b0d0,
 // src/samsung_tv_root/root_agent.py and SamsungTvRemoteInputAgent.cs (Unlicense).
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Net;
@@ -17,13 +18,18 @@ namespace Theatre.Remote
         public int Port { get; }
         public byte[] Token { get; }
         public string Mode { get; }
+        public IReadOnlyCollection<int> Keys { get; }
+        public string? RemoteName { get; }
 
-        private Configuration(IPAddress host, int port, byte[] token, string mode)
+        private Configuration(IPAddress host, int port, byte[] token, string mode,
+            HashSet<int> keys, string? remoteName)
         {
             Host = host;
             Port = port;
             Token = token;
             Mode = mode;
+            Keys = keys;
+            RemoteName = remoteName;
         }
 
         // The staging owner must use a root-private directory and a root-owned
@@ -72,10 +78,12 @@ namespace Theatre.Remote
                 {
                     if (!seen.Add(property.Name)
                         || (property.Name != "host" && property.Name != "port"
-                            && property.Name != "token" && property.Name != "mode"))
+                            && property.Name != "token" && property.Name != "mode"
+                            && property.Name != "keys" && property.Name != "remote_name"))
                         throw new InvalidDataException("unknown or duplicate configuration field");
                 }
-                if (seen.Count != 4)
+                if (!seen.Contains("host") || !seen.Contains("port") || !seen.Contains("token")
+                    || !seen.Contains("mode") || !seen.Contains("keys"))
                     throw new InvalidDataException("missing configuration field");
                 string? hostText = root.GetProperty("host").GetString();
                 if (!IPAddress.TryParse(hostText, out IPAddress? host)
@@ -87,8 +95,35 @@ namespace Theatre.Remote
                 string? mode = root.GetProperty("mode").GetString();
                 if (mode != "observe" && mode != "forward" && mode != "map")
                     throw new InvalidDataException("invalid mode");
+                var keys = new HashSet<int>();
+                JsonElement keyArray = root.GetProperty("keys");
+                if (keyArray.ValueKind != JsonValueKind.Array)
+                    throw new InvalidDataException("keys must be an array");
+                int previous = 0;
+                foreach (JsonElement item in keyArray.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.Number || !item.TryGetInt32(out int key)
+                        || key <= previous || key > 767)
+                        throw new InvalidDataException("keys must be sorted unique integers in 1..767");
+                    keys.Add(key);
+                    previous = key;
+                }
+                if ((mode == "map") != (keys.Count > 0))
+                    throw new InvalidDataException("only map requires nonempty keys");
+                string? remoteName = null;
+                if (root.TryGetProperty("remote_name", out JsonElement remote)
+                    && remote.ValueKind != JsonValueKind.Null)
+                {
+                    if (remote.ValueKind != JsonValueKind.String)
+                        throw new InvalidDataException("remote_name must be a string or null");
+                    remoteName = remote.GetString();
+                    if (string.IsNullOrEmpty(remoteName) || remoteName.Length > 255)
+                        throw new InvalidDataException("invalid remote_name length");
+                    foreach (char c in remoteName)
+                        if (char.IsControl(c)) throw new InvalidDataException("remote_name must be printable");
+                }
                 byte[] token = FrameCodec.DecodeHex(root.GetProperty("token").GetString() ?? "", 32);
-                return new Configuration(host, port, token, mode);
+                return new Configuration(host, port, token, mode, keys, remoteName);
             }
         }
 

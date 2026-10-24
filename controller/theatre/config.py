@@ -1,21 +1,23 @@
-"""Strict host configuration; only two compiled-in application routes exist."""
+"""Strict host configuration with explicitly selected safe application routes."""
 
 from enum import StrEnum
 from ipaddress import IPv4Address
 from pathlib import Path
-from typing import Annotated, ClassVar, Final, Literal, NewType, Self
+from typing import Annotated, ClassVar, Final, NewType, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from theatre.keys import KeyName
+
 AppId = NewType("AppId", str)
-HOME: Final = AppId("Theatre001.Home")
-MOONFIN: Final = AppId("MoonfinApp.moonfin")
-TARGETS: Final = frozenset((HOME, MOONFIN))
+APP_ID_PATTERN: Final = r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$"
+MAX_APP_ID_LENGTH: Final = 128
+RemoteName = Annotated[
+    str, Field(min_length=1, max_length=255, pattern=r"^[^\x00-\x1f\x7f-\x9f]+$")
+]
 HEARTBEAT_SECONDS: Final = 2.0
 RELEASE_SECONDS: Final = 8.0
 FORWARD_SECONDS: Final = 30.0
-HOME_KEY: Final = 63
-TV_PLUS_KEY: Final = 560
 TOKEN_BYTES: Final = 32
 MAX_PROCESS_ID: Final = (1 << 31) - 1
 DEFAULT_STATE_DIRECTORY: Final = Path.home() / ".local" / "state" / "theatre"
@@ -88,11 +90,29 @@ class TelevisionUnavailableError(ControllerError):
 
 
 class SessionPolicyError(ValueError):
-    """An unbounded observer or forwarding test is not permitted."""
+    """An unbounded forwarding test is not permitted."""
 
     def __init__(self) -> None:
-        """Only an explicit map session can have an unlimited host duration."""
-        super().__init__("continuous duration or reconnect requires mode=map")
+        """Keep forwarding bounded independently of non-grabbing discovery."""
+        super().__init__("forward mode requires bounded duration and no reconnect")
+
+
+class MappingPolicyError(ValueError):
+    """Mappings must be unique and used only in map mode."""
+
+    def __init__(self) -> None:
+        """Explain explicit setup requirements."""
+        super().__init__("map mode requires mappings with unique keys; other modes require none")
+
+
+class KeyMapping(BaseModel):
+    """A verified key name mapped to one canonical Tizen application ID."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(
+        frozen=True, extra="forbid", strict=True, hide_input_in_errors=True
+    )
+    key: KeyName
+    app_id: Annotated[AppId, Field(pattern=APP_ID_PATTERN, max_length=MAX_APP_ID_LENGTH)]
 
 
 class AddressPolicyError(ValueError):
@@ -135,16 +155,19 @@ class ControllerConfig(BaseModel):
     command_timeout: Annotated[float, Field(ge=0.1, le=30)] = 5.0
     reconnect_delay: Annotated[float, Field(gt=0, le=60)] = 5.0
     duration: Annotated[float, Field(gt=0, le=FORWARD_SECONDS)] | None = FORWARD_SECONDS
-    remote_name: Literal["Smart Control 2016"] = "Smart Control 2016"
-    remote_bus: Literal["0005"] = "0005"
-    remote_vendor: Literal["04e8"] = "04e8"
-    remote_product: Literal["2075"] = "2075"
+    remote_name: RemoteName | None = None
+    mappings: tuple[KeyMapping, ...] = ()
 
     @model_validator(mode="after")
     def bounded_diagnostics(self) -> Self:
-        """Keep observe/forward bounded even if a config requests otherwise."""
-        if self.mode != Mode.MAP and (self.duration is None or self.reconnect):
+        """Bound forwarding and require explicit, unique map routes."""
+        if self.mode == Mode.FORWARD and (self.duration is None or self.reconnect):
             raise SessionPolicyError
+        if (
+            (self.mode == Mode.MAP) != bool(self.mappings)
+            or len({mapping.key for mapping in self.mappings}) != len(self.mappings)
+        ):
+            raise MappingPolicyError
         if any(
             address.is_unspecified or address.is_multicast or address == BROADCAST_ADDRESS
             for address in (self.tv_host, self.callback_host)

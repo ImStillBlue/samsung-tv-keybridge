@@ -2,11 +2,10 @@
 
 import logging
 import signal
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from enum import IntEnum
 from pathlib import Path
-from types import MappingProxyType
 from typing import Final, Protocol
 
 import anyio
@@ -14,13 +13,8 @@ import typer
 from samsung_tv_root.root_agent import RootAgentUnavailableError
 from samsung_tv_root.sdb import SdbError
 
-from theatre.archive import LaunchResult, root_lease
+from theatre.archive import Application, LaunchResult, root_lease
 from theatre.config import (
-    HOME,
-    HOME_KEY,
-    MOONFIN,
-    TARGETS,
-    TV_PLUS_KEY,
     AppId,
     ControllerConfig,
     ControllerError,
@@ -29,17 +23,21 @@ from theatre.config import (
     RootLostError,
     TelevisionUnavailableError,
 )
+from theatre.keys import SAFE_KEYS
 from theatre.remote import AgentStarter, InputEvent, remote_session
 
-ROUTES: Final = MappingProxyType({HOME_KEY: HOME, TV_PLUS_KEY: MOONFIN})
 logger: Final = logging.getLogger("theatre")
 
 
 class LaunchLease(Protocol):
     """No shell execution capability is exposed to route dispatch."""
 
-    async def installed_apps(self) -> frozenset[AppId]:
+    async def installed_apps(self, requested: frozenset[AppId]) -> frozenset[AppId]:
         """Return the currently registered permitted app targets."""
+        ...
+
+    async def list_apps(self) -> tuple[Application, ...]:
+        """Return registered applications for explicit discovery."""
         ...
 
     async def launch(self, app: AppId) -> LaunchResult:
@@ -71,12 +69,20 @@ class KeyValue(IntEnum):
     REPEAT = 2
 
 
-async def dispatch(lease: LaunchLease, session: EventSession, mode: Mode) -> None:
+async def dispatch(
+    lease: LaunchLease, session: EventSession, mode: Mode, routes: Mapping[int, AppId]
+) -> None:
     """Launch once per physical down; ignore repeats and paired releases."""
     held: set[int] = set()
     while True:
         event = await session.next_event()
-        if mode != Mode.MAP or event.type != 1 or event.code not in ROUTES:
+        if mode == Mode.OBSERVE and event.type == 1 and event.value == 1:
+            name = next((name for name, code in SAFE_KEYS.items() if code == event.code), None)
+            logger.info(
+                "discover.key code=%s name=%s mappable=%s",
+                event.code, name or "unknown", "true" if name else "false",
+            )
+        if mode != Mode.MAP or event.type != 1 or event.code not in routes:
             continue
         match KeyValue(event.value):
             case KeyValue.UP:
@@ -84,7 +90,7 @@ async def dispatch(lease: LaunchLease, session: EventSession, mode: Mode) -> Non
             case KeyValue.DOWN:
                 if event.code not in held:
                     held.add(event.code)
-                    target = ROUTES[event.code]
+                    target = routes[event.code]
                     result = await lease.launch(target)
                     if not result.success:
                         raise ControllerError(Operation.LAUNCH_FAILED)
@@ -104,20 +110,35 @@ async def control_once(
 ) -> None:
     """Validate targets before starting input and preserve playback on every entry."""
     async with acquire(config) as lease:
-        if not await lease.installed_apps() >= TARGETS:
-            raise ControllerError(Operation.TARGETS_MISSING)
+        active = config.mappings
+        if config.mode == Mode.MAP:
+            installed = await lease.installed_apps(frozenset(m.app_id for m in active))
+            for mapping in active:
+                if mapping.app_id not in installed:
+                    logger.warning(
+                        "mapping.skipped key=%s app=%s reason=not-installed",
+                        mapping.key, mapping.app_id,
+                    )
+            active = tuple(m for m in active if m.app_id in installed)
+            if not active:
+                raise ControllerError(Operation.TARGETS_MISSING)
+        if config.mode == Mode.OBSERVE:
+            for app in await lease.list_apps():
+                logger.info("discover.app id=%s name=%s", app.id, app.name)
+        session_config = config.model_copy(update={"mappings": active})
+        routes = {SAFE_KEYS[m.key]: m.app_id for m in active}
         async with (
-            connect(config, lease) as session,
+            connect(session_config, lease) as session,
             anyio.create_task_group() as tasks,
         ):
             logger.info("session.ready mode=%s", config.mode.value)
             tasks.start_soon(lease.watch_health)
             try:
                 if config.duration is None:
-                    await dispatch(lease, session, config.mode)
+                    await dispatch(lease, session, config.mode, routes)
                 else:
                     with anyio.move_on_after(config.duration):
-                        await dispatch(lease, session, config.mode)
+                        await dispatch(lease, session, config.mode, routes)
             finally:
                 tasks.cancel_scope.cancel()
 

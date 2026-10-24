@@ -16,15 +16,17 @@ namespace Theatre.Remote
     {
         private readonly string mode;
         private readonly int pointerBytes;
+        private readonly HashSet<int> keys;
         private readonly List<byte[]> packet = new List<byte[]>();
         public const int MaximumEvents = 256;
 
-        public PacketFilter(string mode, int pointerBytes)
+        public PacketFilter(string mode, int pointerBytes, IEnumerable<int> keys)
         {
             if (mode != "observe" && mode != "forward" && mode != "map")
                 throw new InvalidDataException("invalid input mode");
             this.mode = mode;
             this.pointerBytes = pointerBytes;
+            this.keys = new HashSet<int>(keys);
         }
 
         public Delivery[] Add(byte[] record)
@@ -47,7 +49,7 @@ namespace Theatre.Remote
                 if (input.Type == 4 && input.Code == 4) scans.Add(index);
                 if (input.Type == 1)
                 {
-                    if (input.Code == 63 || input.Code == 560)
+                    if (keys.Contains(input.Code))
                     {
                         // Hold scans until their key is known: forwarding the scan
                         // early could leak a suppressed shortcut into native input.
@@ -84,14 +86,15 @@ namespace Theatre.Remote
                     var native = new NativeIo();
                     string[] nodes = Directory.GetFiles("/dev/input", "event*");
                     Array.Sort(nodes, StringComparer.Ordinal);
-                    using (InputDevice input = InputDevice.Discover(native, nodes, IntPtr.Size))
+                    using (InputDevice input = InputDevice.Discover(
+                        native, nodes, IntPtr.Size, config.Keys, config.RemoteName))
                     {
                         var health = new Health(new MonotonicClock());
                         using (var channel = new AuthenticatedChannel(
                             SocketTransport.Connect(config, health), health, config.Token))
                         {
                             RunSession(input, channel, health, config.Mode, native,
-                                NativeIo.getpid(), NativeIo.getuid(), NativeIo.getgid());
+                                NativeIo.getpid(), NativeIo.getuid(), NativeIo.getgid(), config.Keys);
                         }
                     }
                 }
@@ -107,12 +110,13 @@ namespace Theatre.Remote
         }
 
         internal static void RunSession(InputDevice input, AuthenticatedChannel channel,
-            Health health, string mode, ISessionWaiter waiter, int pid, uint uid, uint gid)
+            Health health, string mode, ISessionWaiter waiter, int pid, uint uid, uint gid,
+            IEnumerable<int> keys)
         {
             UinputForwarder? forwarder = null;
             try
             {
-                var filter = new PacketFilter(mode, input.PointerBytes);
+                var filter = new PacketFilter(mode, input.PointerBytes, keys);
                 channel.Handshake(input.Identity.Json(pid, uid, gid, mode));
                 health.Check();
                 if (mode != "observe")

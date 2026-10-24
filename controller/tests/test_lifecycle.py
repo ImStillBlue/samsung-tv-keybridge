@@ -10,11 +10,12 @@ from typing import NoReturn
 import anyio
 import pytest
 
+from tests.routes import MAPPINGS, TARGETS
+from tests.test_controller import Events
 from tests.test_remote import LoopbackAgent
 from theatre import archive, main
-from theatre.archive import LaunchResult
+from theatre.archive import Application, LaunchResult
 from theatre.config import (
-    TARGETS,
     AppId,
     ControllerConfig,
     ControllerError,
@@ -23,6 +24,7 @@ from theatre.config import (
     RootLostError,
     TelevisionUnavailableError,
 )
+from theatre.remote import InputEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,15 +36,18 @@ class ActiveLease:
     applications: frozenset[AppId] = TARGETS
     launch_success: bool = True
 
-    async def installed_apps(self) -> frozenset[AppId]:
-        return self.applications
+    async def installed_apps(self, requested: frozenset[AppId]) -> frozenset[AppId]:
+        return self.applications & requested
+
+    async def list_apps(self) -> tuple[Application, ...]:
+        return tuple(Application(app, "Title") for app in self.applications)
 
     async def launch(self, app: AppId) -> LaunchResult:
         self.launches.append(app)
         return LaunchResult(self.launch_success)
 
-    async def stage_remote(self, port: int, token: bytes) -> None:
-        await self.agent.stage_remote(port, token)
+    async def stage_remote(self, port: int, token: bytes, keys: frozenset[int]) -> None:
+        await self.agent.stage_remote(port, token, keys)
 
     async def watch_health(self) -> None:
         self.health_started.set()
@@ -75,7 +80,9 @@ async def test_root_loss_closes_real_input_peer_before_root_lease(
     config: ControllerConfig,
 ) -> None:
     # Given an authenticated real input callback and a root-health failure signal.
-    configured = config.model_copy(update={"mode": Mode.MAP, "duration": None})
+    configured = config.model_copy(update={
+        "mode": Mode.MAP, "mappings": MAPPINGS, "duration": None,
+    })
     trace: list[str] = []
     closed, started, lost, finished = (anyio.Event() for _ in range(4))
     launches: list[AppId] = []
@@ -120,14 +127,17 @@ async def test_missing_targets_prevent_input_start(config: ControllerConfig) -> 
     @asynccontextmanager
     async def acquire(_config: ControllerConfig) -> AsyncIterator[main.ControllerLease]:
         class MissingTargets:
-            async def installed_apps(self) -> frozenset[AppId]:
-                return frozenset()
+            async def list_apps(self) -> tuple[Application, ...]:
+                return ()
+
+            async def installed_apps(self, requested: frozenset[AppId]) -> frozenset[AppId]:
+                return requested & frozenset()
 
             async def launch(self, app: AppId) -> LaunchResult:
                 raise AssertionError(app)
 
-            async def stage_remote(self, port: int, token: bytes) -> None:
-                raise AssertionError((port, len(token)))
+            async def stage_remote(self, port: int, token: bytes, keys: frozenset[int]) -> None:
+                raise AssertionError((port, len(token), keys))
 
             async def watch_health(self) -> None:
                 raise AssertionError
@@ -139,7 +149,9 @@ async def test_missing_targets_prevent_input_start(config: ControllerConfig) -> 
 
     # When target readiness is checked.
     with pytest.raises(ControllerError) as failure:
-        await main.control_once(config, acquire=acquire)
+        await main.control_once(
+            config.model_copy(update={"mode": Mode.MAP, "mappings": MAPPINGS}), acquire=acquire,
+        )
     # Then no input session starts and the root lease still closes.
     assert failure.value.operation == Operation.TARGETS_MISSING
     assert trace == ["root.close"]
@@ -177,7 +189,9 @@ async def test_reconnect_waits_for_retry_signal_without_launching(
     config: ControllerConfig, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Given one lost transport and an explicitly armed reconnect policy.
-    configured = config.model_copy(update={"mode": Mode.MAP, "duration": None, "reconnect": True})
+    configured = config.model_copy(update={
+        "mode": Mode.MAP, "mappings": MAPPINGS, "duration": None, "reconnect": True,
+    })
     waiting, retry, finished = anyio.Event(), anyio.Event(), anyio.Event()
     attempts: list[ControllerConfig] = []
 
@@ -210,3 +224,52 @@ async def test_reconnect_waits_for_retry_signal_without_launching(
         tasks.cancel_scope.cancel()
     # Then reconnection only re-enters supervision; it invents no foreground action.
     assert attempts == [configured, configured]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", [Mode.MAP, Mode.OBSERVE])
+async def test_inventory_filters_routes_before_input_and_logs_discovery(
+    config: ControllerConfig, caplog: pytest.LogCaptureFixture, mode: Mode,
+) -> None:
+    # Given only one installed target, When starting, Then only its key can be intercepted.
+    caplog.set_level("INFO", logger="theatre")
+    connected: list[ControllerConfig] = []
+    launches: list[AppId] = []
+    configured = config.model_copy(update={
+        "mode": mode, "mappings": MAPPINGS if mode == Mode.MAP else (),
+    })
+    async with anyio.create_task_group() as tasks:
+        agent = LoopbackAgent(tasks, anyio.Event(), mode.value)
+        lease = ActiveLease(
+            agent, anyio.Event(), anyio.Event(), launches, frozenset({MAPPINGS[0].app_id}),
+        )
+
+        @asynccontextmanager
+        async def acquire(_config: ControllerConfig) -> AsyncIterator[ActiveLease]:
+            yield lease
+
+        @asynccontextmanager
+        async def connect(
+            actual: ControllerConfig, _lease: main.ControllerLease,
+        ) -> AsyncIterator[Events]:
+            connected.append(actual)
+            yield Events((
+                InputEvent(1, 1, 63, 1, mode != Mode.MAP),
+                InputEvent(2, 1, 560, 1, forwarded=True),
+            ), [0])
+
+        with pytest.raises(ExceptionGroup) as failure:
+            await main.control_once(configured, acquire=acquire, connect=connect)
+        assert failure.value.subgroup(anyio.EndOfStream) is not None
+        tasks.cancel_scope.cancel()
+    if mode == Mode.MAP:
+        assert connected[0].mappings == (MAPPINGS[0],)
+        assert launches == [MAPPINGS[0].app_id]
+        assert (
+            "mapping.skipped key=tv_plus app=MoonfinApp.moonfin reason=not-installed"
+            in caplog.text
+        )
+    else:
+        assert connected[0].mappings == ()
+        assert launches == []
+        assert "discover.app id=Theatre001.Home name=Title" in caplog.text

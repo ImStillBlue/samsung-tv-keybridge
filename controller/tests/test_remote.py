@@ -42,7 +42,8 @@ class LoopbackAgent:
     payloads: tuple[str, ...] = ()
     corrupt_identity: bool = False
 
-    async def stage_remote(self, port: int, token: bytes) -> None:
+    async def stage_remote(self, port: int, token: bytes, keys: frozenset[int]) -> None:
+        assert all(1 <= key <= 767 for key in keys)
         self.tasks.start_soon(self.run, port, token)
 
     async def run(self, port: int, token: bytes) -> None:
@@ -153,7 +154,7 @@ def test_invalid_event_is_rejected(payload: str) -> None:
     # Given an authenticated but invalid event boundary.
     # When parsing for map mode.
     with pytest.raises(ProtocolError):
-        _ = InputEvent.parse(payload, 0, Mode.MAP)
+        _ = InputEvent.parse(payload, 0, Mode.MAP, frozenset({63, 560}))
     # Then no dispatchable value was produced.
 
 
@@ -176,8 +177,8 @@ def test_managed_wire_fixture_matches_host_encoder() -> None:
 
 
 @pytest.mark.parametrize(("field", "value"), [
-    ("user_id", 1), ("group_id", 1), ("device", "theatre-forwarded-remote"),
-    ("bus", "0006"), ("vendor", "0000"), ("product", "0000"),
+    ("user_id", 1), ("group_id", 1), ("device", "bad\nname"),
+    ("bus", "0006"), ("vendor", "0000"), ("product", "xyz"),
 ])
 def test_untrusted_identity_is_rejected(field: str, value: str | int) -> None:
     # Given an identity JSON from a peer which must never be grabbed.
@@ -192,3 +193,26 @@ def test_untrusted_identity_is_rejected(field: str, value: str | int) -> None:
     with pytest.raises(ValidationError):
         _ = RemoteIdentity.model_validate_json(json.dumps(identity))
     # Then it cannot reach READY.
+
+
+def test_forwarding_validation_uses_only_active_keys() -> None:
+    # Given Home active and TV Plus skipped, When frames arrive, Then only Home is suppressed.
+    keys = frozenset({63})
+    assert InputEvent.parse("EVENT\t1\t1\t560\t1\t1", 0, Mode.MAP, keys).forwarded
+    assert not InputEvent.parse("EVENT\t1\t1\t63\t1\t0", 0, Mode.MAP, keys).forwarded
+    with pytest.raises(ProtocolError):
+        _ = InputEvent.parse("EVENT\t1\t1\t560\t1\t0", 0, Mode.MAP, keys)
+
+
+@pytest.mark.anyio
+async def test_remote_selection_is_logged(
+    config: ControllerConfig, caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Given an authenticated remote, When ready, Then its physical selection is logged.
+    caplog.set_level("INFO", logger="theatre")
+    closed = anyio.Event()
+    async with anyio.create_task_group() as tasks:
+        agent = LoopbackAgent(tasks, closed, "observe")
+        async with remote_session(config, agent):
+            assert "remote.selected device=Smart Control 2016 product=2075" in caplog.text
+        tasks.cancel_scope.cancel()

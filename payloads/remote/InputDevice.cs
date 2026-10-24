@@ -53,7 +53,6 @@ namespace Theatre.Remote
 
     internal sealed class RemoteIdentity
     {
-        public const string PhysicalName = "Smart Control 2016";
         public const string VirtualName = "theatre-forwarded-remote";
         public string Name { get; }
         public string Node { get; }
@@ -73,8 +72,7 @@ namespace Theatre.Remote
             Version = BitConverter.ToUInt16(id, 6);
         }
 
-        public bool Matches => Name == PhysicalName && Bus == 0x0005
-            && Vendor == 0x04e8 && Product == 0x2075;
+        public bool Matches => Name != VirtualName && Bus == 0x0005 && Vendor == 0x04e8;
 
         public string Json(int pid, uint uid, uint gid, string mode)
         {
@@ -273,7 +271,8 @@ namespace Theatre.Remote
         public static bool Has(byte[] bits, int code) =>
             code >= 0 && code / 8 < bits.Length && (bits[code / 8] & (1 << (code % 8))) != 0;
 
-        public static InputDevice Discover(IDeviceIo io, IEnumerable<string> nodes, int pointerBytes)
+        public static InputDevice Discover(IDeviceIo io, IEnumerable<string> nodes, int pointerBytes,
+            IEnumerable<int> requiredKeys, string? remoteName = null)
         {
             InputEvent.Size(pointerBytes);
             InputDevice? selected = null;
@@ -289,14 +288,17 @@ namespace Theatre.Remote
                         int end = Array.IndexOf(name, (byte)0);
                         if (end < 0) throw new InvalidDataException("unterminated device name");
                         string text = new UTF8Encoding(false, true).GetString(name, 0, end);
-                        if (text != RemoteIdentity.PhysicalName) continue;
+                        if (remoteName != null && text != remoteName) continue;
                         var identity = new RemoteIdentity(text, node,
                             io.Query(descriptor, NativeIo.QueryCode(2, 8), 8));
                         if (!identity.Matches) continue;
                         byte[] events = io.Query(descriptor, NativeIo.QueryCode(0x20, 4), 4);
                         byte[] keys = io.Query(descriptor, NativeIo.QueryCode(0x21, 96), 96);
-                        if (!Has(events, 0) || !Has(events, 1) || !Has(keys, 63) || !Has(keys, 560))
-                            throw new InvalidDataException("remote is missing required key capabilities");
+                        if (!Has(events, 0) || !Has(events, 1)) continue;
+                        bool capable = true;
+                        foreach (int key in requiredKeys)
+                            if (!Has(keys, key)) capable = false;
+                        if (!capable) continue;
                         byte[] misc = Has(events, 4)
                             ? io.Query(descriptor, NativeIo.QueryCode(0x24, 1), 1) : new byte[1];
                         if (selected != null) throw new InvalidDataException("ambiguous physical remote");
