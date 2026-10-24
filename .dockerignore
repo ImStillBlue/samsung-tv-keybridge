@@ -1,0 +1,21 @@
+# Allow only owned build inputs; never send local state, caches or identities.
+**
+!Dockerfile
+!.dockerignore
+!upstream.lock.json
+!packaging/
+!packaging/fetch-build-inputs.sh
+!packaging/NuGet.Config
+!packaging/sdb
+!scripts/
+!scripts/build-payloads.js
+!payloads/
+!payloads/remote/
+!payloads/remote/*.cs
+!payloads/remote/*.csproj
+!controller/
+!controller/pyproject.toml
+!controller/uv.lock
+!controller/theatre/
+!controller/theatre/**/*.py
+!controller/theatre/*.py

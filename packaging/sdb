@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+case "$(uname -m)" in
+    aarch64) set -- /opt/keybridge/qemu-x86_64-static \
+        /opt/keybridge/amd64/ld-linux-x86-64.so.2 \
+        --inhibit-cache --library-path /opt/keybridge/amd64 \
+        /opt/keybridge/sdb.real "$@" ;;
+    x86_64) set -- \
+    /opt/keybridge/amd64/ld-linux-x86-64.so.2 \
+    --inhibit-cache --library-path /opt/keybridge/amd64 \
+    /opt/keybridge/sdb.real "$@" ;;
+    *) exit 1 ;;
+esac
+exec "$@"

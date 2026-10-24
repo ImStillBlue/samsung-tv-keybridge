@@ -1,0 +1,35 @@
+name: Samsung TV KeyBridge
+version: "0.6.0"
+slug: samsung_tv_keybridge
+description: Restore temporary TV root and Home/TV Plus mappings when your TV is awake.
+url: https://github.com/ImStillBlue/samsung-tv-keybridge
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: auto
+init: true
+host_network: true
+timeout: 120
+options:
+  enabled: false
+  tv_host: ""
+  callback_host: ""
+  reconnect_delay: 15
+  discover: false
+  developer_bridge: false
+  developer_clients: []
+  mappings: []
+schema:
+  enabled: bool
+  tv_host: str
+  callback_host: str
+  reconnect_delay: "int(5,60)"
+  discover: bool
+  developer_bridge: bool
+  developer_clients:
+    - str
+  remote_name: "str?"
+  mappings:
+    - key: "list(home|tv_plus)"
+      app_id: 'match(^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$)'
